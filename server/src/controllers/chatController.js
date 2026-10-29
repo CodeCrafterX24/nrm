@@ -9,6 +9,7 @@ const logger_1 = __importDefault(require("../logger.js"));
 const ClientError_1 = require("../models/ClientError.js");
 const config_1 = require("../config/repositoryFactory.js");
 const chatService_1 = require("../services/chatService.js");
+const permissions_1 = require("../services/permissions.js");
 const log = (0, logger_1.default)(__filename);
 const clampLimit = (value) => {
     const n = parseInt(String(value ?? ""), 10);
@@ -76,18 +77,32 @@ const getMissingMessages = async (req, res) => {
 };
 exports.getMissingMessages = getMissingMessages;
 /**
- * GET /api/chat/export?format=txt|json&lang=bn|en
- * Full-history export for every logged-in user.
- * txt = clean plain text (HTML stripped), json = raw data (reactions, edits, ...)
+ * GET /api/chat/export?format=txt|html|json&lang=bn|en
+ * Full-history export for every logged-in user (unless the admin restricted
+ * the copy feature to admins via /api/chat/admin-settings).
+ * txt = clean plain text (HTML stripped), html = rich rendering exactly like
+ * the chat shows it, json = raw data (reactions, edits, ...)
  */
 const exportChat = async (req, res) => {
     try {
-        const format = req.query?.format === "json" ? "json" : "txt";
+        // the admin may restrict the export feature to admins or to a hand-picked
+        // list of users ("selected"); admins always keep access
+        const settings = await (0, config_1.getSettingRepository)().get();
+        if (!(0, permissions_1.canUseCopyAll)(settings[0], req.session?.userInfo)) {
+            return res.status(403).json({ message: "client_error.admin_only" });
+        }
+        const format = ["json", "html"].includes(req.query?.format) ? req.query.format : "txt";
         const lang = req.query?.lang === "en" ? "en" : "bn";
         if (format === "json") {
             const data = await (0, chatService_1.buildExportJson)();
             res.setHeader("Content-Disposition", 'inline; filename="chat-export.json"');
             res.status(200).json(data);
+        }
+        else if (format === "html") {
+            const html = await (0, chatService_1.buildExportHtml)(lang);
+            res.setHeader("Content-Type", "text/html; charset=utf-8");
+            res.setHeader("Content-Disposition", 'inline; filename="chat-export.html"');
+            res.status(200).send(html);
         }
         else {
             const text = await (0, chatService_1.buildExportTxt)(lang);

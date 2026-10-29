@@ -33,11 +33,16 @@ dotenv.config();
 const express_1 = __importDefault(require("express"));
 const path_1 = __importDefault(require("path"));
 const express_session_1 = __importDefault(require("express-session"));
+const require_1 = __importDefault(require("crypto"));
 const auth_1 = __importDefault(require("./routes/authRouter.js"));
 const router_1 = __importDefault(require("./routes/apiRouter.js"));
 const memorystore_1 = __importDefault(require("memorystore"));
 const paths_1 = require("./paths.js");
-require("./logger.js");
+const config_1 = require("./config/repositoryFactory.js");
+const permissions_1 = require("./services/permissions.js");
+const attendanceService_1 = require("./services/attendanceService.js");
+const logger_1 = __importDefault(require("./logger.js"));
+const log = (0, logger_1.default)(__filename);
 // initialize storage repository and insert dummy admin user( with super admin role)
 require("./bootstrap/initData.js");
 const app = (0, express_1.default)();
@@ -46,8 +51,20 @@ exports.app = app;
 app.set("trust proxy", 1);
 // liveness probe for Render health checks (kept before session middleware so it stays cheap)
 app.get("/healthz", (req, res) => {
-    res.status(200).json({ status: "ok", uptime: process.uptime() });
+    res.status(200).json({ status: "ok", version: APP_VERSION, uptime: process.uptime() });
 });
+// app version — single source of truth is package.json
+const APP_VERSION = (() => {
+    try {
+        return require(path_1.default.join(paths_1.PROJECT_ROOT, "package.json")).version;
+    }
+    catch {
+        return process.env.APP_VERSION || "3.0.0";
+    }
+})();
+// session signing key: from the environment in production; a fresh random value
+// per boot when it is absent (local dev) so no shared literal ever signs cookies
+const sessionSecret = process.env.SESSION_SECRET || require_1.default.randomBytes(32).toString("hex");
 let sessionStore;
 if (process.env.NODE_ENV === "development")
     // use basic memoryStore in development mode for less memory usage
@@ -60,7 +77,7 @@ else {
 }
 const sessionMiddleware = (0, express_session_1.default)({
     // secret from environment; the hardcoded value is only a fallback for local dev
-    secret: process.env.SESSION_SECRET || "My_T00P-Secr@t",
+    secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
     cookie: {
@@ -77,7 +94,44 @@ app.use(sessionMiddleware);
 app.use(express_1.default.json({ limit: "1mb" }));
 app.use(express_1.default.urlencoded({ extended: false }));
 // serve react static contents (absolute path so the CWD doesn't matter)
-app.use(express_1.default.static(paths_1.PROJECT_ROOT && path_1.default.join(paths_1.PROJECT_ROOT, "public")));
+// serve react static contents (absolute path so the CWD doesn't matter);
+// etags stay on so the ?v= cache-busting query in index.html always picks up
+// freshly changed addon files
+app.use(express_1.default.static(paths_1.PROJECT_ROOT && path_1.default.join(paths_1.PROJECT_ROOT, "public"), {
+    etag: true,
+    lastModified: true,
+    cacheControl: false,
+}));
+/**
+ * Attendance counter — a standalone raw-html page.
+ *
+ * GET /attendance renders the admin-authored html document and NOTHING else:
+ * no SPA shell, no navbar, no injected script. The session still decides who
+ * may open it (admins + the hand-picked "selected" list).
+ */
+const attendanceCounter = async (req, res) => {
+    const user = req.session?.userInfo;
+    if (!user?.username) {
+        const page = (0, attendanceService_1.attendanceEmptyPage)("/login");
+        return res.status(page.status).set(page.headers).send(page.body);
+    }
+    let setting = null;
+    try {
+        const settings = await (0, config_1.getSettingRepository)().get();
+        setting = settings[0] || null;
+    }
+    catch (error) {
+        log.error(error);
+        return res.status(503).set("Content-Type", "text/plain; charset=utf-8").send("storage unavailable");
+    }
+    if (!setting || !(0, permissions_1.canViewAttendance)(setting, user)) {
+        const page = (0, attendanceService_1.attendanceDeniedPage)();
+        return res.status(page.status).set(page.headers).send(page.body);
+    }
+    const page = (0, attendanceService_1.renderAttendancePage)(setting.attendanceHtml);
+    res.status(page.status).set(page.headers).send(page.body);
+};
+app.get(["/attendance", "/attendance/"], attendanceCounter);
 // ***************** List of routes starts ***********************
 // Mount auth router at /auth
 app.use("/auth", auth_1.default);

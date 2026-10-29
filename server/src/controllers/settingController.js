@@ -4,8 +4,111 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.restoreFrequentSymbols = exports.saveFrequentSymbols = exports.getFrequentSymbols = exports.saveAdjustedHijri = exports.getHijriAdjustment = exports.deleteChat = exports.canWeChat = exports.disableChat = exports.enableChat = exports.downloadFormatted = exports.downloadChat = exports.updateNotice = exports.getNotice = void 0;
+exports.saveAttendanceHtml = exports.getAttendanceSettings = exports.restoreFrequentSymbols = exports.saveFrequentSymbols = exports.getFrequentSymbols = exports.saveAdjustedHijri = exports.getHijriAdjustment = exports.deleteChat = exports.canWeChat = exports.disableChat = exports.enableChat = exports.downloadFormatted = exports.downloadChat = exports.updateNotice = exports.getNotice = void 0;
 exports.getHijri = getHijri;
+/** feature visibility for the addon layer — every logged-in user may read it */
+const getVisibility = async (req, res) => {
+    try {
+        const setting = await getSetting();
+        // resolved booleans, not usernames: the list of selected users stays admin-only
+        res.status(200).json((0, permissions_1.permissionSummary)(setting, req.session?.userInfo));
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.getVisibility = getVisibility;
+/**
+ * admin toggle for the addon features: copy button, online-users list and the
+ * attendance counter; each "selected" mode also stores its own username list
+ */
+const saveAdminSettings = async (req, res) => {
+    if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+    try {
+        const repository = (0, config_1.getSettingRepository)();
+        const setting = await getSetting();
+        const { copyAllMode, copyAllSelected, showOnlineUsers, onlineUsersSelected, attendanceViewMode, attendanceSelected, } = req.body || {};
+        if (copyAllMode !== undefined) {
+            if (!permissions_1.MODES.includes(copyAllMode))
+                return res.sendStatus(400);
+            setting.copyAllMode = copyAllMode;
+        }
+        if (copyAllSelected !== undefined)
+            setting.copyAllSelected = (0, Setting_1.normalizeUsernames)(copyAllSelected);
+        if (showOnlineUsers !== undefined) {
+            // legacy clients send a boolean; new ones send the mode string
+            const mode = typeof showOnlineUsers === "boolean"
+                ? (showOnlineUsers ? "all" : "admin")
+                : showOnlineUsers;
+            if (!permissions_1.MODES.includes(mode))
+                return res.sendStatus(400);
+            setting.showOnlineUsers = mode;
+        }
+        if (onlineUsersSelected !== undefined)
+            setting.onlineUsersSelected = (0, Setting_1.normalizeUsernames)(onlineUsersSelected);
+        if (attendanceViewMode !== undefined) {
+            // the attendance page is never public — only admin/selected are allowed
+            if (attendanceViewMode !== "admin" && attendanceViewMode !== "selected")
+                return res.sendStatus(400);
+            setting.attendanceViewMode = attendanceViewMode;
+        }
+        if (attendanceSelected !== undefined)
+            setting.attendanceSelected = (0, Setting_1.normalizeUsernames)(attendanceSelected);
+        await repository.update(setting);
+        res.status(200).json((0, permissions_1.permissionSummary)(setting, req.session?.userInfo));
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.saveAdminSettings = saveAdminSettings;
+/** admin-only read of the full permission lists (the panel needs the names) */
+const getAdminSettings = async (req, res) => {
+    if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+    try {
+        const setting = await getSetting();
+        res.status(200).json((0, permissions_1.adminSettingsPayload)(setting));
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.getAdminSettings = getAdminSettings;
+/** admin-only read of the attendance counter settings (html + who may view it) */
+const getAttendanceSettings = async (req, res) => {
+    if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+    try {
+        const setting = await getSetting();
+        res.status(200).json((0, attendanceService_1.attendanceSettingsPayload)(setting));
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.getAttendanceSettings = getAttendanceSettings;
+/** admin-only write of the raw html that GET /attendance renders */
+const saveAttendanceHtml = async (req, res) => {
+    if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+    try {
+        const html = (0, attendanceService_1.validateAttendanceHtml)(req.body?.attendanceHtml);
+        if (html === null)
+            return res.status(400).json({ errorMessage: "client_error.too_large_error" });
+        const repository = (0, config_1.getSettingRepository)();
+        const setting = await getSetting();
+        setting.attendanceHtml = html;
+        await repository.update(setting);
+        log.info(`attendance html saved (${html.length} chars)`);
+        res.status(200).json((0, attendanceService_1.attendanceSettingsPayload)(setting));
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.saveAttendanceHtml = saveAttendanceHtml;
 const logger_1 = __importDefault(require("../logger.js"));
 const ClientError_1 = require("../models/ClientError.js");
 const ChatService_1 = require("../services/chatService.js");
@@ -13,6 +116,8 @@ const config_1 = require("../config/repositoryFactory.js");
 const Setting_1 = require("../models/Setting.js");
 const SettingService_1 = require("../services/settingService.js");
 const htmlSanitizer_1 = require("../services/htmlSanitizer.js");
+const permissions_1 = require("../services/permissions.js");
+const attendanceService_1 = require("../services/attendanceService.js");
 const log = (0, logger_1.default)(__filename);
 /** the settings store may still be initializing at boot — fail softly instead of crashing */
 async function getSetting() {

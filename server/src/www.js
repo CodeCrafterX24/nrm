@@ -15,6 +15,7 @@ const http_1 = require("http");
 const SocketService_1 = __importDefault(require("./socket/socketService.js"));
 const socket_io_1 = require("socket.io");
 const logger_1 = __importDefault(require("./logger.js"));
+const sessionGuard_1 = require("./services/sessionGuard.js");
 const log = (0, logger_1.default)(__filename);
 /**
  * Get port from environment and store in Express.
@@ -25,7 +26,9 @@ app_1.app.set("port", port);
  * Create HTTP server.
  */
 const nodeServer = (0, http_1.createServer)(app_1.app);
-const io = new socket_io_1.Server(nodeServer, { serveClient: false });
+// serveClient on: the addon layer loads the official client from
+// /socket.io/socket.io.js for its own custom-reaction connection
+const io = new socket_io_1.Server(nodeServer, { serveClient: true });
 // convert a connect middleware to a Socket.IO middleware
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 //@ts-ignore
@@ -38,6 +41,11 @@ io.use((socket, next) => {
         // the seeded default admin must finish the forced password change first
         if (session.userInfo?.mustChangePassword) {
             return next(new Error("password_change_required"));
+        }
+        // admin-kicked users may not open new sockets with old sessions
+        if (sessionGuard_1.isRevoked(session.userInfo?.username, session.userInfo?.loginAt)) {
+            session.destroy(() => { });
+            return next(new Error("unauthorized"));
         }
         next();
     }
@@ -60,6 +68,32 @@ const destroySocketSession = (sessionId) => {
     io.in(sessionId).disconnectSockets();
 };
 exports.destroySocketSession = destroySocketSession;
+/**
+ * Admin kick: drop every live socket of `username` (all their devices and
+ * tabs). Their express sessions are invalidated separately by the revocation
+ * map (services/sessionGuard.js) checked in the API and socket middlewares.
+ * @param {string} username
+ */
+const kickUserSockets = (username) => {
+    let dropped = 0;
+    for (const socket of io.sockets.sockets.values()) {
+        const sessionUsername = socket.request?.session?.userInfo?.username;
+        if (sessionUsername && sessionUsername.toLowerCase() === String(username || "").toLowerCase()) {
+            // destroy the underlying express session so an instant reconnect fails
+            try {
+                socket.request.session.destroy(() => { });
+            }
+            catch (err) {
+                log.error(err);
+            }
+            socket.disconnect(true);
+            dropped++;
+        }
+    }
+    log.debug(`kickUserSockets(${username}): dropped ${dropped} socket(s)`);
+    return dropped;
+};
+exports.kickUserSockets = kickUserSockets;
 /**
  * Listen on provided port, on all network interfaces.
  */

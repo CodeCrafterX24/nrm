@@ -38926,7 +38926,10 @@ var require_UserDto = __commonJS({
       isAdmin;
       soundPref;
       mustChangePassword;
-      constructor(id, username, langPref, active, isAdmin, soundPref, mustChangePassword = false) {
+      /** epoch ms of the login that created this session — lets the admin
+          kick revoke only sessions created before the kick */
+      loginAt;
+      constructor(id, username, langPref, active, isAdmin, soundPref, mustChangePassword = false, loginAt = 0) {
         this.id = id;
         this.username = username;
         this.langPref = langPref;
@@ -38934,6 +38937,7 @@ var require_UserDto = __commonJS({
         this.isAdmin = isAdmin;
         this.soundPref = soundPref;
         this.mustChangePassword = mustChangePassword;
+        this.loginAt = loginAt;
       }
     };
     exports2.SessionUser = SessionUser;
@@ -46792,7 +46796,7 @@ var require_authController = __commonJS({
         throw ClientError_1.ClientError.invalidError();
       }
       await new Promise((resolve, reject) => req.session.regenerate((err) => err ? reject(err) : resolve()));
-      req.session.userInfo = new UserDto_1.SessionUser(user.id, user.username, user.langPref, user.active, user.isAdmin, user.soundPref, user.mustChangePassword === true);
+      req.session.userInfo = new UserDto_1.SessionUser(user.id, user.username, user.langPref, user.active, user.isAdmin, user.soundPref, user.mustChangePassword === true, Date.now());
       req.session.authenticated = true;
       await new Promise((resolve, reject) => req.session.save((err) => err ? reject(err) : resolve()));
       log.debug(`login sessionId: ${req.sessionID}`);
@@ -46810,6 +46814,34 @@ var require_authController = __commonJS({
       });
       log.debug(`after logout sessionId: ${req.sessionID}`);
     };
+  }
+});
+
+// server/src/services/sessionGuard.js
+var require_sessionGuard = __commonJS({
+  "server/src/services/sessionGuard.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.revokeUser = revokeUser;
+    exports2.isRevoked = isRevoked;
+    exports2.getRevokedAt = getRevokedAt;
+    var revokedUsers = /* @__PURE__ */ new Map();
+    function revokeUser(username) {
+      const at = Date.now();
+      revokedUsers.set(String(username || "").toLowerCase(), at);
+      return at;
+    }
+    function getRevokedAt(username) {
+      const at = revokedUsers.get(String(username || "").toLowerCase());
+      return typeof at === "number" ? at : 0;
+    }
+    function isRevoked(username, loginAt) {
+      const at = getRevokedAt(username);
+      if (!at)
+        return false;
+      const login = Number(loginAt) || 0;
+      return login < at;
+    }
   }
 });
 
@@ -46848,11 +46880,13 @@ var require_userController = __commonJS({
       return mod && mod.__esModule ? mod : { "default": mod };
     };
     Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.updateSoundPref = exports2.updateLangPref = exports2.unsuspendUser = exports2.suspendUser = exports2.removeUser = exports2.makeUserRegular = exports2.makeUserAdmin = exports2.getUsers = exports2.getLoggedInUserInfo = exports2.changePassword = exports2.addUser = void 0;
+    exports2.updateSoundPref = exports2.updateLangPref = exports2.kickUser = exports2.unsuspendUser = exports2.suspendUser = exports2.removeUser = exports2.makeUserRegular = exports2.makeUserAdmin = exports2.getUsers = exports2.getLoggedInUserInfo = exports2.changePassword = exports2.addUser = void 0;
     var logger_1 = __importDefault(require_logger2());
     var UserDto_1 = require_UserDto();
     var ClientError_1 = require_ClientError();
     var userCrudService = __importStar(require_userCrudService());
+    var sessionGuard_1 = require_sessionGuard();
+    var www_1 = require_www();
     var log = (0, logger_1.default)(__filename);
     var getLoggedInUserInfo = async (req, res) => {
       res.json(req.session.userInfo);
@@ -46891,7 +46925,11 @@ var require_userController = __commonJS({
       log.debug("Getting users...");
       try {
         const users = await userCrudService.getUsers();
-        res.status(200).json(users.map((u) => u.toSafeJson ? u.toSafeJson() : u));
+        const loggedIn = await getLoggedInUsernames(req);
+        res.status(200).json(users.map((u) => ({
+          ...u.toSafeJson ? u.toSafeJson() : u,
+          loggedIn: loggedIn.has(String(u.username || "").toLowerCase())
+        })));
       } catch (error) {
         if (error instanceof ClientError_1.ClientError) {
           res.status(400).json({
@@ -46904,6 +46942,34 @@ var require_userController = __commonJS({
       }
     };
     exports2.getUsers = getUsers;
+    function getLoggedInUsernames(req) {
+      return new Promise((resolve) => {
+        const store = req.sessionStore;
+        if (!store || typeof store.all !== "function") {
+          resolve(/* @__PURE__ */ new Set());
+          return;
+        }
+        store.all((err, sessions) => {
+          const names = /* @__PURE__ */ new Set();
+          if (!err && sessions) {
+            const list = Array.isArray(sessions) ? sessions : Object.values(sessions);
+            const now = Date.now();
+            for (const s of list) {
+              const info = s?.userInfo;
+              if (!s?.authenticated || !info?.username)
+                continue;
+              const expires = s.cookie?.expires ? new Date(s.cookie.expires).getTime() : 0;
+              if (expires && expires <= now)
+                continue;
+              if ((0, sessionGuard_1.isRevoked)(info.username, info.loginAt))
+                continue;
+              names.add(String(info.username).toLowerCase());
+            }
+          }
+          resolve(names);
+        });
+      });
+    }
     var removeUser = async (req, res) => {
       if (!req.session?.userInfo?.isAdmin) {
         res.sendStatus(403);
@@ -46984,6 +47050,35 @@ var require_userController = __commonJS({
       }
     };
     exports2.unsuspendUser = unsuspendUser;
+    var kickUser = async (req, res) => {
+      if (!req.session?.userInfo?.isAdmin) {
+        res.sendStatus(403);
+        return;
+      }
+      const username = typeof req.body?.username === "string" ? req.body.username.trim() : "";
+      if (!username || username.length > 50) {
+        res.status(400).json({ message: "client_error.invalid_error" });
+        return;
+      }
+      if (username.toLowerCase() === String(req.session.userInfo.username || "").toLowerCase()) {
+        res.status(400).json({ message: "client_error.invalid_error" });
+        return;
+      }
+      try {
+        const users = await userCrudService.getUserByUserName(username);
+        if (users.length === 0) {
+          res.status(400).json({ message: "client_error.not_exists_error" });
+          return;
+        }
+        (0, sessionGuard_1.revokeUser)(username);
+        const sockets = (0, www_1.kickUserSockets)(username);
+        log.debug(`User ${username} kicked by admin, dropped ${sockets} socket(s).`);
+        res.status(200).json({ kicked: username, sockets });
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.kickUser = kickUser;
     var changePassword = async (req, res) => {
       try {
         const currentPassword = typeof req.body?.currentPassword === "string" ? req.body.currentPassword : void 0;
@@ -58758,6 +58853,70 @@ and ensure you are accounting for this risk.
   }
 });
 
+// server/src/services/htmlSanitizer.js
+var require_htmlSanitizer = __commonJS({
+  "server/src/services/htmlSanitizer.js"(exports2) {
+    "use strict";
+    var __importDefault = exports2 && exports2.__importDefault || function(mod) {
+      return mod && mod.__esModule ? mod : { "default": mod };
+    };
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.sanitizeMessageHtml = sanitizeMessageHtml;
+    exports2.sanitizeNoticeHtml = sanitizeNoticeHtml;
+    exports2.MAX_MESSAGE_CHARS = exports2.MAX_NOTICE_CHARS = void 0;
+    var sanitize_html_1 = __importDefault(require_sanitize_html());
+    var MAX_MESSAGE_CHARS = parseInt(process.env.MAX_MESSAGE_CHARS || "5000", 10);
+    exports2.MAX_MESSAGE_CHARS = MAX_MESSAGE_CHARS;
+    var MAX_NOTICE_CHARS = parseInt(process.env.MAX_NOTICE_CHARS || "20000", 10);
+    exports2.MAX_NOTICE_CHARS = MAX_NOTICE_CHARS;
+    var baseOptions = {
+      allowedTags: [
+        ...sanitize_html_1.default.defaults.allowedTags,
+        "img",
+        "audio",
+        "video",
+        "source",
+        "figure",
+        "figcaption",
+        "style",
+        "s",
+        "u",
+        "font",
+        "mark",
+        "details",
+        "summary",
+        "del",
+        "ins"
+      ],
+      allowedAttributes: {
+        "*": ["style", "class", "title", "dir", "lang", "align"],
+        a: ["href", "name", "target", "rel"],
+        img: ["src", "srcset", "alt", "width", "height", "loading"],
+        audio: ["src", "controls", "loop", "preload"],
+        video: ["src", "controls", "width", "height", "poster", "preload", "loop"],
+        source: ["src", "type"],
+        td: ["colspan", "rowspan"],
+        th: ["colspan", "rowspan"],
+        font: ["color", "face", "size"],
+        details: ["open"]
+      },
+      allowedSchemes: ["http", "https", "mailto"],
+      allowedSchemesByTag: { img: ["http", "https", "data"], audio: ["http", "https"], video: ["http", "https"], source: ["http", "https"] },
+      allowProtocolRelative: false
+    };
+    function sanitizeMessageHtml(text) {
+      if (typeof text !== "string")
+        return "";
+      return (0, sanitize_html_1.default)(text, baseOptions);
+    }
+    function sanitizeNoticeHtml(text) {
+      if (typeof text !== "string")
+        return "";
+      return (0, sanitize_html_1.default)(text, baseOptions);
+    }
+  }
+});
+
 // server/src/services/chatService.js
 var require_chatService = __commonJS({
   "server/src/services/chatService.js"(exports2) {
@@ -58766,11 +58925,12 @@ var require_chatService = __commonJS({
       return mod && mod.__esModule ? mod : { "default": mod };
     };
     Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.deleteAllChat = exports2.buildExportTxt = exports2.buildExportJson = exports2.downloadAll = exports2.downloadJson = void 0;
+    exports2.deleteAllChat = exports2.buildExportTxt = exports2.buildExportHtml = exports2.buildExportJson = exports2.downloadAll = exports2.downloadJson = void 0;
     var logger_1 = __importDefault(require_logger2());
     var ClientError_1 = require_ClientError();
     var config_1 = require_repositoryFactory();
     var sanitize_html_1 = __importDefault(require_sanitize_html());
+    var htmlSanitizer_1 = require_htmlSanitizer();
     var log = (0, logger_1.default)(__filename);
     async function getAllMessages() {
       const repository = (0, config_1.getMessageRepository)();
@@ -58881,6 +59041,88 @@ ${line}
       return header + body + "\n";
     };
     exports2.buildExportTxt = buildExportTxt;
+    var HTML_I18N = {
+      bn: {
+        title: "Our Discussion Room \u2014 \u09AA\u09C2\u09B0\u09CD\u09A3 \u0995\u09A5\u09CB\u09AA\u0995\u09A5\u09A8",
+        exported: "\u098F\u0995\u09CD\u09B8\u09AA\u09CB\u09B0\u09CD\u099F",
+        total: "\u09AE\u09CB\u099F \u09AE\u09C7\u09B8\u09C7\u099C",
+        edited: "\u09B8\u09AE\u09CD\u09AA\u09BE\u09A6\u09BF\u09A4",
+        replyTo: "\u0989\u09A4\u09CD\u09A4\u09B0 \u2192",
+        reactions: "\u09B0\u09BF\u0985\u09CD\u09AF\u09BE\u0995\u09B6\u09A8",
+        empty: "\u0995\u09CB\u09A8\u09CB \u09AE\u09C7\u09B8\u09C7\u099C \u09A8\u09C7\u0987\u0964"
+      },
+      en: {
+        title: "Our Discussion Room \u2014 full conversation",
+        exported: "Exported",
+        total: "Total messages",
+        edited: "edited",
+        replyTo: "reply to",
+        reactions: "reactions",
+        empty: "No messages."
+      }
+    };
+    var escapeHtml = (value) => String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    var buildExportHtml = async (lang = "bn") => {
+      const i18n = HTML_I18N[lang] || HTML_I18N.bn;
+      const messages = await getAllMessages();
+      const cards = messages.map((m) => {
+        const edited = m.edited_at ? `<span class="edited">\u270E ${escapeHtml(i18n.edited)}</span>` : "";
+        const reply = m.replyTo ? `<div class="reply">\u21B3 ${escapeHtml(i18n.replyTo)} <b>${escapeHtml(m.replyTo.username || "?")}</b>${m.replyTo.id ? ` <span class="rid">#${escapeHtml(m.replyTo.id)}</span>` : ""}: <span class="rtext">${escapeHtml(plainText(m.replyTo.text).slice(0, 120))}</span></div>` : "";
+        const reactions = m.reactions && Object.keys(m.reactions).length ? `<div class="reacts">${Object.entries(m.reactions).filter(([, r]) => r && Array.isArray(r.usernames)).map(([emoji, r]) => `<span class="react">${escapeHtml(emoji)}${r.usernames.length ? ` \xD7${r.usernames.length}` : ""}</span>`).join(" ")}</div>` : "";
+        const body = (0, htmlSanitizer_1.sanitizeMessageHtml)(String(m.text ?? "")) || `<span class="empty-body">\u2026</span>`;
+        return [
+          `<div class="msg">`,
+          `  <div class="head"><span class="user">${escapeHtml(m.username || "?")}</span><span class="time">${escapeHtml(formatTimestamp(m.time))}</span>${edited}</div>`,
+          reply,
+          `  <div class="body" dir="auto">${body}</div>`,
+          reactions,
+          `</div>`
+        ].filter(Boolean).join("\n");
+      });
+      const style = `
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #eef1f5; color: #1d2129;
+      font-family: "Noto Sans Bengali", "Hind Siliguri", -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      font-size: 15px; line-height: 1.55; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 24px 14px 48px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .meta { color: #65676b; font-size: 13px; margin: 0 0 20px; }
+    .msg { background: #fff; border: 1px solid #e2e6ea; border-radius: 12px;
+      padding: 10px 14px; margin: 0 0 10px; overflow-wrap: break-word; }
+    .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+    .user { font-weight: 600; color: #0b5cff; }
+    .time { color: #8a8d91; font-size: 12px; }
+    .edited { color: #f0a020; font-size: 12px; }
+    .reply { background: #f0f2f5; border-inline-start: 3px solid #c3cbd6; border-radius: 6px;
+      padding: 4px 10px; margin: 0 0 6px; font-size: 13px; color: #444950; }
+    .reply .rtext { font-style: italic; }
+    .reply .rid, .body img, .body audio, .body video { max-width: 100%; }
+    .reply .rid { color: #8a8d91; font-size: 11px; }
+    .body img { border-radius: 8px; }
+    .reacts { margin-top: 6px; }
+    .react { background: #e7f0ff; border: 1px solid #c3d7f7; border-radius: 999px;
+      display: inline-block; padding: 0 8px; font-size: 13px; margin-inline-end: 4px; }
+    .empty-body { color: #8a8d91; }`;
+      return `<!DOCTYPE html>
+<html lang="${lang === "en" ? "en" : "bn"}" dir="${lang === "en" ? "ltr" : "rtl"}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(i18n.title)}</title>
+<style>${style}</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>${escapeHtml(i18n.title)}</h1>
+  <p class="meta">${escapeHtml(i18n.exported)}: ${escapeHtml(formatTimestamp((/* @__PURE__ */ new Date()).toISOString()))} \xB7 ${escapeHtml(i18n.total)}: ${messages.length}</p>
+${messages.length ? cards.join("\n") : `  <div class="msg">${escapeHtml(i18n.empty)}</div>`}
+</div>
+</body>
+</html>
+`;
+    };
+    exports2.buildExportHtml = buildExportHtml;
     var deleteAllChat = async (res) => {
       const repository = (0, config_1.getMessageRepository)();
       await repository.removeAll();
@@ -58894,12 +59136,12 @@ var require_Setting = __commonJS({
   "server/src/models/Setting.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.initialFrequentSymbols = exports2.Setting = void 0;
+    exports2.initialFrequentSymbols = exports2.ATTENDANCE_DEFAULT_HTML = exports2.SETTING_LIMITS = exports2.PERMISSION_MODES = exports2.Setting = void 0;
     var BaseModel_1 = require_BaseModel();
     var initialFrequentSymbols = `
 \u270B
 \u0986\u09B8\u09B8\u09BE\u09B2\u09BE\u09AE\u09C1 \u0986\u09B2\u09BE\u0987\u0995\u09C1\u09AE
-\u0993\u09DF\u09BE\u09B2\u09BE\u0987\u0995\u09C1\u09AE\u09C1\u09B8 \u09B8\u09BE\u09B2\u09BE\u09AE
+\u0993\u09AF\u09BC\u09BE\u09B2\u09BE\u0987\u0995\u09C1\u09AE\u09C1\u09B8 \u09B8\u09BE\u09B2\u09BE\u09AE
 <img src="https://" width="200" height="100" />
 <b></b>
 <i></i>
@@ -58907,11 +59149,134 @@ var require_Setting = __commonJS({
 <figure><figcaption>Listen to the This:</figcaption><audio controls src="https://some_sound.mp3"></audio><a href="https://some_sound.mp3">Download audio</a></figure>
 `;
     exports2.initialFrequentSymbols = initialFrequentSymbols;
+    var PERMISSION_MODES = ["all", "admin", "selected"];
+    exports2.PERMISSION_MODES = PERMISSION_MODES;
+    var SETTING_LIMITS = {
+      /** UI-editable html for the attendance counter page (raw html, not sanitized) */
+      attendanceHtml: 3e5,
+      /** one username entry */
+      username: 50,
+      /** members of a selected-users list */
+      members: 200
+    };
+    exports2.SETTING_LIMITS = SETTING_LIMITS;
+    var ATTENDANCE_DEFAULT_HTML = `<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>\u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u0995\u09BE\u0989\u09A8\u09CD\u099F\u09BE\u09B0</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 24px 16px; font-family: "Noto Sans Bengali", "Hind Siliguri", system-ui, sans-serif;
+         background: #f6f7f9; color: #1b1f24; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.hint { margin: 0 0 20px; font-size: 13px; color: #5b6572; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+  input, button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid #c9d1da; }
+  button { background: #2563eb; color: #fff; border-color: #2563eb; cursor: pointer; }
+  button.ghost { background: #fff; color: #1b1f24; border-color: #c9d1da; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { background: #fff; border: 1px solid #e3e8ee; border-radius: 10px; padding: 10px 12px;
+       margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+  .empty { color: #5b6572; font-size: 14px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #12161b; color: #e8edf3; }
+    li, button.ghost { background: #1b2128; border-color: #2b333d; }
+    p.hint, .empty { color: #9aa5b1; }
+  }
+</style>
+</head>
+<body>
+  <h1>\u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u0995\u09BE\u0989\u09A8\u09CD\u099F\u09BE\u09B0</h1>
+  <p class="hint">\u098F\u0987 \u09AA\u09C7\u099C\u09C7\u09B0 \u09B8\u09AE\u09CD\u09AA\u09C2\u09B0\u09CD\u09A3 \u0995\u09CB\u09A1 \u0985\u09CD\u09AF\u09BE\u09A1\u09AE\u09BF\u09A8 \u09B8\u09C7\u099F\u09BF\u0982\u09B8 \u09A5\u09C7\u0995\u09C7 \u09AC\u09A6\u09B2\u09BE\u09A8\u09CB \u09AF\u09BE\u09AF\u09BC\u0964</p>
+  <div class="row">
+    <input id="who" placeholder="\u09A8\u09BE\u09AE \u09B2\u09BF\u0996\u09C1\u09A8" />
+    <button id="add">\u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u09A6\u09BF\u09A8</button>
+    <button id="reset" class="ghost">\u09B0\u09BF\u09B8\u09C7\u099F</button>
+  </div>
+  <ul id="list"></ul>
+  <p class="empty" id="empty">\u098F\u0996\u09A8\u09CB \u0995\u09C7\u0989 \u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u09A6\u09C7\u09AF\u09BC\u09A8\u09BF\u0964</p>
+  <script>
+    (function () {
+      var KEY = "attendance-records";
+      var list = document.getElementById("list");
+      var empty = document.getElementById("empty");
+      var who = document.getElementById("who");
+      function read() { try { return JSON.parse(localStorage.getItem(KEY) || "[]"); } catch (e) { return []; } }
+      function write(rows) { localStorage.setItem(KEY, JSON.stringify(rows)); }
+      function render() {
+        var rows = read();
+        list.innerHTML = "";
+        rows.forEach(function (r, i) {
+          var li = document.createElement("li");
+          var span = document.createElement("span");
+          span.textContent = r.name + " \u2014 " + r.at;
+          var del = document.createElement("button");
+          del.className = "ghost";
+          del.textContent = "\u2715";
+          del.onclick = function () { var next = read(); next.splice(i, 1); write(next); render(); };
+          li.appendChild(span);
+          li.appendChild(del);
+          list.appendChild(li);
+        });
+        empty.style.display = rows.length ? "none" : "";
+      }
+      document.getElementById("add").onclick = function () {
+        var name = (who.value || "").trim();
+        if (!name) return;
+        var rows = read();
+        rows.push({ name: name, at: new Date().toLocaleString("bn-BD") });
+        write(rows);
+        who.value = "";
+        render();
+      };
+      document.getElementById("reset").onclick = function () { write([]); render(); };
+      render();
+    })();
+  </script>
+</body>
+</html>
+`;
+    exports2.ATTENDANCE_DEFAULT_HTML = ATTENDANCE_DEFAULT_HTML;
+    var normalizeMode = (value, fallback) => PERMISSION_MODES.includes(value) ? value : fallback;
+    var normalizeUsernames = (value) => {
+      const raw = Array.isArray(value) ? value : typeof value === "string" ? value.split(/[\n,]+/) : [];
+      const out = [];
+      for (const entry of raw) {
+        if (typeof entry !== "string")
+          continue;
+        const name = entry.trim().slice(0, SETTING_LIMITS.username);
+        if (!name)
+          continue;
+        if (out.some((existing) => existing.toLowerCase() === name.toLowerCase()))
+          continue;
+        out.push(name);
+        if (out.length >= SETTING_LIMITS.members)
+          break;
+      }
+      return out;
+    };
+    exports2.normalizeUsernames = normalizeUsernames;
     var Setting = class extends BaseModel_1.BaseModel {
       notice;
       chatState;
       hijri;
       frequentSymbols;
+      /** who may use the "copy all" export — "all" | "admin" | "selected" */
+      copyAllMode;
+      /** usernames allowed to copy when copyAllMode === "selected" */
+      copyAllSelected;
+      /** who may see the online-users list — "all" | "admin" | "selected" */
+      showOnlineUsers;
+      /** usernames allowed to see the list when showOnlineUsers === "selected" */
+      onlineUsersSelected;
+      /** who may open the attendance counter page — "admin" | "selected" */
+      attendanceViewMode;
+      /** usernames allowed to open the attendance page when the mode is "selected" */
+      attendanceSelected;
+      /** raw, admin-editiable html rendered by GET /attendance */
+      attendanceHtml;
       constructor(json = {}) {
         super(json);
         this.notice = json.notice || "";
@@ -58922,6 +59287,14 @@ var require_Setting = __commonJS({
           adjustment: 0
         };
         this.frequentSymbols = initialFrequentSymbols;
+        const legacyOnline = typeof json.showOnlineUsers === "boolean" ? json.showOnlineUsers ? "all" : "admin" : json.showOnlineUsers;
+        this.copyAllMode = normalizeMode(json.copyAllMode, "all");
+        this.copyAllSelected = normalizeUsernames(json.copyAllSelected);
+        this.showOnlineUsers = normalizeMode(legacyOnline, "all");
+        this.onlineUsersSelected = normalizeUsernames(json.onlineUsersSelected);
+        this.attendanceViewMode = normalizeMode(json.attendanceViewMode, "admin") === "all" ? "admin" : normalizeMode(json.attendanceViewMode, "admin");
+        this.attendanceSelected = normalizeUsernames(json.attendanceSelected);
+        this.attendanceHtml = typeof json.attendanceHtml === "string" ? json.attendanceHtml.slice(0, SETTING_LIMITS.attendanceHtml) : "";
       }
     };
     exports2.Setting = Setting;
@@ -59004,67 +59377,139 @@ var require_settingService = __commonJS({
   }
 });
 
-// server/src/services/htmlSanitizer.js
-var require_htmlSanitizer = __commonJS({
-  "server/src/services/htmlSanitizer.js"(exports2) {
+// server/src/services/permissions.js
+var require_permissions = __commonJS({
+  "server/src/services/permissions.js"(exports2) {
     "use strict";
-    var __importDefault = exports2 && exports2.__importDefault || function(mod) {
-      return mod && mod.__esModule ? mod : { "default": mod };
-    };
     Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.sanitizeMessageHtml = sanitizeMessageHtml;
-    exports2.sanitizeNoticeHtml = sanitizeNoticeHtml;
-    exports2.MAX_MESSAGE_CHARS = exports2.MAX_NOTICE_CHARS = void 0;
-    var sanitize_html_1 = __importDefault(require_sanitize_html());
-    var MAX_MESSAGE_CHARS = parseInt(process.env.MAX_MESSAGE_CHARS || "5000", 10);
-    exports2.MAX_MESSAGE_CHARS = MAX_MESSAGE_CHARS;
-    var MAX_NOTICE_CHARS = parseInt(process.env.MAX_NOTICE_CHARS || "20000", 10);
-    exports2.MAX_NOTICE_CHARS = MAX_NOTICE_CHARS;
-    var baseOptions = {
-      allowedTags: [
-        ...sanitize_html_1.default.defaults.allowedTags,
-        "img",
-        "audio",
-        "video",
-        "source",
-        "figure",
-        "figcaption",
-        "style",
-        "s",
-        "u",
-        "font",
-        "mark",
-        "details",
-        "summary",
-        "del",
-        "ins"
-      ],
-      allowedAttributes: {
-        "*": ["style", "class", "title", "dir", "lang", "align"],
-        a: ["href", "name", "target", "rel"],
-        img: ["src", "srcset", "alt", "width", "height", "loading"],
-        audio: ["src", "controls", "loop", "preload"],
-        video: ["src", "controls", "width", "height", "poster", "preload", "loop"],
-        source: ["src", "type"],
-        td: ["colspan", "rowspan"],
-        th: ["colspan", "rowspan"],
-        font: ["color", "face", "size"],
-        details: ["open"]
-      },
-      allowedSchemes: ["http", "https", "mailto"],
-      allowedSchemesByTag: { img: ["http", "https", "data"], audio: ["http", "https"], video: ["http", "https"], source: ["http", "https"] },
-      allowProtocolRelative: false
+    var MODES = ["all", "admin", "selected"];
+    var isset = (value) => value !== void 0 && value !== null && value !== "";
+    var normalizeMode = (value, fallback) => MODES.includes(value) ? value : fallback;
+    var memberList = (value) => Array.isArray(value) ? value : [];
+    var isListed = (list, username) => {
+      if (!username) return false;
+      const needle = String(username).toLowerCase();
+      return memberList(list).some(
+        (entry) => typeof entry === "string" && entry.trim().toLowerCase() === needle
+      );
     };
-    function sanitizeMessageHtml(text) {
-      if (typeof text !== "string")
-        return "";
-      return (0, sanitize_html_1.default)(text, baseOptions);
-    }
-    function sanitizeNoticeHtml(text) {
-      if (typeof text !== "string")
-        return "";
-      return (0, sanitize_html_1.default)(text, baseOptions);
-    }
+    var canUseFeature = (mode, selected, user) => {
+      if (!user || !user.username) return false;
+      if (user.isAdmin) return true;
+      if (mode === "all") return true;
+      if (mode === "selected") return isListed(selected, user.username);
+      return false;
+    };
+    var canUseCopyAll = (setting, user) => canUseFeature(
+      normalizeMode(setting?.copyAllMode, "all"),
+      setting?.copyAllSelected,
+      user
+    );
+    var canSeeOnlineUsers = (setting, user) => canUseFeature(
+      normalizeMode(setting?.showOnlineUsers, "all"),
+      setting?.onlineUsersSelected,
+      user
+    );
+    var canViewAttendance = (setting, user) => canUseFeature(
+      normalizeMode(setting?.attendanceViewMode, "admin"),
+      setting?.attendanceSelected,
+      user
+    );
+    var permissionSummary = (setting, user) => ({
+      copyAllMode: normalizeMode(setting?.copyAllMode, "all"),
+      copyAllSelectedCount: memberList(setting?.copyAllSelected).length,
+      canCopyAll: canUseCopyAll(setting, user),
+      showOnlineUsers: normalizeMode(setting?.showOnlineUsers, "all"),
+      onlineUsersSelectedCount: memberList(setting?.onlineUsersSelected).length,
+      canSeeOnlineUsers: canSeeOnlineUsers(setting, user),
+      attendanceMode: normalizeMode(setting?.attendanceViewMode, "admin"),
+      attendanceSelectedCount: memberList(setting?.attendanceSelected).length,
+      canViewAttendance: canViewAttendance(setting, user),
+      hasAttendanceHtml: typeof setting?.attendanceHtml === "string" && setting.attendanceHtml.length > 0,
+      version: isset(setting?.version) ? setting.version : void 0
+    });
+    var adminSettingsPayload = (setting) => ({
+      copyAllMode: normalizeMode(setting?.copyAllMode, "all"),
+      copyAllSelected: memberList(setting?.copyAllSelected),
+      showOnlineUsers: normalizeMode(setting?.showOnlineUsers, "all"),
+      onlineUsersSelected: memberList(setting?.onlineUsersSelected),
+      attendanceMode: normalizeMode(setting?.attendanceViewMode, "admin"),
+      attendanceSelected: memberList(setting?.attendanceSelected)
+    });
+    exports2.MODES = MODES;
+    exports2.adminSettingsPayload = adminSettingsPayload;
+    exports2.canSeeOnlineUsers = canSeeOnlineUsers;
+    exports2.canUseCopyAll = canUseCopyAll;
+    exports2.canUseFeature = canUseFeature;
+    exports2.canViewAttendance = canViewAttendance;
+    exports2.isListed = isListed;
+    exports2.normalizeMode = normalizeMode;
+    exports2.permissionSummary = permissionSummary;
+  }
+});
+
+// server/src/services/attendanceService.js
+var require_attendanceService = __commonJS({
+  "server/src/services/attendanceService.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    var Setting_1 = require_Setting();
+    var SETTING_LIMITS = Setting_1.SETTING_LIMITS;
+    exports2.SETTING_LIMITS = SETTING_LIMITS;
+    var attendanceSettingsPayload = (setting) => ({
+      attendanceViewMode: setting?.attendanceViewMode === "selected" ? "selected" : "admin",
+      attendanceSelected: Array.isArray(setting?.attendanceSelected) ? setting.attendanceSelected : [],
+      attendanceHtml: typeof setting?.attendanceHtml === "string" ? setting.attendanceHtml : "",
+      // always sent: the editor's "restore starter page" button must work even
+      // after the admin saved a custom document
+      defaultHtml: Setting_1.ATTENDANCE_DEFAULT_HTML,
+      limit: SETTING_LIMITS.attendanceHtml
+    });
+    var validateAttendanceHtml = (value) => {
+      if (typeof value !== "string") return "";
+      if (value.length > SETTING_LIMITS.attendanceHtml) return null;
+      return value;
+    };
+    var HEADERS = {
+      "Content-Type": "text/html; charset=utf-8",
+      // the page is admin-authored and may embed its own scripts — keep the
+      // browser from sniffing a different type, but allow inline code
+      "X-Content-Type-Options": "nosniff",
+      // never let a proxy/CDN hand a stale editor state back to the admin
+      "Cache-Control": "no-store, max-age=0",
+      // the document is self-contained; no external framing
+      "X-Frame-Options": "SAMEORIGIN"
+    };
+    var renderAttendancePage = (html) => ({
+      status: 200,
+      headers: HEADERS,
+      body: typeof html === "string" && html.trim().length > 0 ? html : Setting_1.ATTENDANCE_DEFAULT_HTML
+    });
+    var attendanceDeniedPage = () => ({
+      status: 403,
+      headers: HEADERS,
+      body: `<!doctype html>
+<html lang="bn"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>\u09AA\u09CD\u09B0\u09AC\u09C7\u09B6\u09BE\u09A7\u09BF\u0995\u09BE\u09B0 \u09A8\u09C7\u0987</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:"Noto Sans Bengali",system-ui,sans-serif;background:#f6f7f9;color:#1b1f24;padding:24px;text-align:center}h1{font-size:18px;margin:0 0 8px}p{margin:0;color:#5b6572;font-size:14px}</style>
+</head><body><div><h1>\u098F\u0987 \u09AA\u09C7\u099C \u09A6\u09C7\u0996\u09BE\u09B0 \u0985\u09A8\u09C1\u09AE\u09A4\u09BF \u09A8\u09C7\u0987</h1><p>\u0985\u09CD\u09AF\u09BE\u09A1\u09AE\u09BF\u09A8\u09C7\u09B0 \u09B8\u09BE\u09A5\u09C7 \u09AF\u09CB\u0997\u09BE\u09AF\u09CB\u0997 \u0995\u09B0\u09C1\u09A8\u0964</p></div></body></html>`
+    });
+    var attendanceEmptyPage = (loginPath) => ({
+      status: 401,
+      headers: HEADERS,
+      body: `<!doctype html>
+<html lang="bn"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>\u09B2\u0997\u0987\u09A8 \u09AA\u09CD\u09B0\u09AF\u09BC\u09CB\u099C\u09A8</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:"Noto Sans Bengali",system-ui,sans-serif;background:#f6f7f9;color:#1b1f24;padding:24px;text-align:center}a{display:inline-block;margin-top:14px;padding:9px 16px;border-radius:8px;background:#2563eb;color:#fff;text-decoration:none;font-size:14px}</style>
+</head><body><div><h1>\u09B2\u0997\u0987\u09A8 \u0995\u09B0\u09C1\u09A8</h1><p>\u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u0995\u09BE\u0989\u09A8\u09CD\u099F\u09BE\u09B0 \u09A6\u09C7\u0996\u09A4\u09C7 \u09AA\u09CD\u09B0\u09A5\u09AE\u09C7 \u0985\u09CD\u09AF\u09BE\u09AA\u09C7 \u09B2\u0997\u0987\u09A8 \u0995\u09B0\u09A4\u09C7 \u09B9\u09AC\u09C7\u0964</p><a href="${loginPath || "/login"}">\u09B2\u0997\u0987\u09A8 \u09AA\u09C7\u099C\u09C7 \u09AF\u09BE\u09A8</a></div></body></html>`
+    });
+    exports2.attendanceSettingsPayload = attendanceSettingsPayload;
+    exports2.validateAttendanceHtml = validateAttendanceHtml;
+    exports2.renderAttendancePage = renderAttendancePage;
+    exports2.attendanceDeniedPage = attendanceDeniedPage;
+    exports2.attendanceEmptyPage = attendanceEmptyPage;
   }
 });
 
@@ -59076,8 +59521,93 @@ var require_settingController = __commonJS({
       return mod && mod.__esModule ? mod : { "default": mod };
     };
     Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.restoreFrequentSymbols = exports2.saveFrequentSymbols = exports2.getFrequentSymbols = exports2.saveAdjustedHijri = exports2.getHijriAdjustment = exports2.deleteChat = exports2.canWeChat = exports2.disableChat = exports2.enableChat = exports2.downloadFormatted = exports2.downloadChat = exports2.updateNotice = exports2.getNotice = void 0;
+    exports2.saveAttendanceHtml = exports2.getAttendanceSettings = exports2.restoreFrequentSymbols = exports2.saveFrequentSymbols = exports2.getFrequentSymbols = exports2.saveAdjustedHijri = exports2.getHijriAdjustment = exports2.deleteChat = exports2.canWeChat = exports2.disableChat = exports2.enableChat = exports2.downloadFormatted = exports2.downloadChat = exports2.updateNotice = exports2.getNotice = void 0;
     exports2.getHijri = getHijri;
+    var getVisibility = async (req, res) => {
+      try {
+        const setting = await getSetting();
+        res.status(200).json((0, permissions_1.permissionSummary)(setting, req.session?.userInfo));
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.getVisibility = getVisibility;
+    var saveAdminSettings = async (req, res) => {
+      if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+      try {
+        const repository = (0, config_1.getSettingRepository)();
+        const setting = await getSetting();
+        const { copyAllMode, copyAllSelected, showOnlineUsers, onlineUsersSelected, attendanceViewMode, attendanceSelected } = req.body || {};
+        if (copyAllMode !== void 0) {
+          if (!permissions_1.MODES.includes(copyAllMode))
+            return res.sendStatus(400);
+          setting.copyAllMode = copyAllMode;
+        }
+        if (copyAllSelected !== void 0)
+          setting.copyAllSelected = (0, Setting_1.normalizeUsernames)(copyAllSelected);
+        if (showOnlineUsers !== void 0) {
+          const mode = typeof showOnlineUsers === "boolean" ? showOnlineUsers ? "all" : "admin" : showOnlineUsers;
+          if (!permissions_1.MODES.includes(mode))
+            return res.sendStatus(400);
+          setting.showOnlineUsers = mode;
+        }
+        if (onlineUsersSelected !== void 0)
+          setting.onlineUsersSelected = (0, Setting_1.normalizeUsernames)(onlineUsersSelected);
+        if (attendanceViewMode !== void 0) {
+          if (attendanceViewMode !== "admin" && attendanceViewMode !== "selected")
+            return res.sendStatus(400);
+          setting.attendanceViewMode = attendanceViewMode;
+        }
+        if (attendanceSelected !== void 0)
+          setting.attendanceSelected = (0, Setting_1.normalizeUsernames)(attendanceSelected);
+        await repository.update(setting);
+        res.status(200).json((0, permissions_1.permissionSummary)(setting, req.session?.userInfo));
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.saveAdminSettings = saveAdminSettings;
+    var getAdminSettings = async (req, res) => {
+      if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+      try {
+        const setting = await getSetting();
+        res.status(200).json((0, permissions_1.adminSettingsPayload)(setting));
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.getAdminSettings = getAdminSettings;
+    var getAttendanceSettings = async (req, res) => {
+      if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+      try {
+        const setting = await getSetting();
+        res.status(200).json((0, attendanceService_1.attendanceSettingsPayload)(setting));
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.getAttendanceSettings = getAttendanceSettings;
+    var saveAttendanceHtml = async (req, res) => {
+      if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+      try {
+        const html = (0, attendanceService_1.validateAttendanceHtml)(req.body?.attendanceHtml);
+        if (html === null)
+          return res.status(400).json({ errorMessage: "client_error.too_large_error" });
+        const repository = (0, config_1.getSettingRepository)();
+        const setting = await getSetting();
+        setting.attendanceHtml = html;
+        await repository.update(setting);
+        log.info(`attendance html saved (${html.length} chars)`);
+        res.status(200).json((0, attendanceService_1.attendanceSettingsPayload)(setting));
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.saveAttendanceHtml = saveAttendanceHtml;
     var logger_1 = __importDefault(require_logger2());
     var ClientError_1 = require_ClientError();
     var ChatService_1 = require_chatService();
@@ -59085,6 +59615,8 @@ var require_settingController = __commonJS({
     var Setting_1 = require_Setting();
     var SettingService_1 = require_settingService();
     var htmlSanitizer_1 = require_htmlSanitizer();
+    var permissions_1 = require_permissions();
+    var attendanceService_1 = require_attendanceService();
     var log = (0, logger_1.default)(__filename);
     async function getSetting() {
       const settings = await (0, config_1.getSettingRepository)().get();
@@ -59291,6 +59823,7 @@ var require_chatController = __commonJS({
     var ClientError_1 = require_ClientError();
     var config_1 = require_repositoryFactory();
     var chatService_1 = require_chatService();
+    var permissions_1 = require_permissions();
     var log = (0, logger_1.default)(__filename);
     var clampLimit = (value) => {
       const n = parseInt(String(value ?? ""), 10);
@@ -59352,12 +59885,21 @@ var require_chatController = __commonJS({
     exports2.getMissingMessages = getMissingMessages;
     var exportChat = async (req, res) => {
       try {
-        const format = req.query?.format === "json" ? "json" : "txt";
+        const settings = await (0, config_1.getSettingRepository)().get();
+        if (!(0, permissions_1.canUseCopyAll)(settings[0], req.session?.userInfo)) {
+          return res.status(403).json({ message: "client_error.admin_only" });
+        }
+        const format = ["json", "html"].includes(req.query?.format) ? req.query.format : "txt";
         const lang = req.query?.lang === "en" ? "en" : "bn";
         if (format === "json") {
           const data = await (0, chatService_1.buildExportJson)();
           res.setHeader("Content-Disposition", 'inline; filename="chat-export.json"');
           res.status(200).json(data);
+        } else if (format === "html") {
+          const html = await (0, chatService_1.buildExportHtml)(lang);
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.setHeader("Content-Disposition", 'inline; filename="chat-export.html"');
+          res.status(200).send(html);
         } else {
           const text = await (0, chatService_1.buildExportTxt)(lang);
           res.setHeader("Content-Type", "text/plain; charset=utf-8");
@@ -59391,12 +59933,22 @@ var require_apiRouter = __commonJS({
     var SettingController_1 = require_settingController();
     var UserController_1 = require_userController();
     var ChatController_1 = require_chatController();
+    var sessionGuard_1 = require_sessionGuard();
     var router = express_1.default.Router();
     router.use((req, res, next) => {
       if (req.session?.userInfo?.username)
         next();
       else
         res.status(401).json({ message: "You were logged out, Log in please" });
+    });
+    router.use((req, res, next) => {
+      const user = req.session?.userInfo;
+      if (user && (0, sessionGuard_1.isRevoked)(user.username, user.loginAt)) {
+        req.session.destroy(() => {
+        });
+        return res.status(401).json({ message: "You were logged out, Log in please" });
+      }
+      next();
     });
     router.use((req, res, next) => {
       const user = req.session?.userInfo;
@@ -59410,6 +59962,7 @@ var require_apiRouter = __commonJS({
     router.post("/langPref", UserController_1.updateLangPref);
     router.get("/users", UserController_1.getUsers);
     router.post("/users", UserController_1.addUser);
+    router.post("/users/kick", UserController_1.kickUser);
     router.get("/users/me", UserController_1.getLoggedInUserInfo);
     router.delete("/users/:id", UserController_1.removeUser);
     router.put("/users/:id/make-admin", UserController_1.makeUserAdmin);
@@ -59428,6 +59981,11 @@ var require_apiRouter = __commonJS({
     router.get("/chat/download-json", SettingController_1.downloadChat);
     router.get("/chat/download", SettingController_1.downloadFormatted);
     router.get("/chat/export", ChatController_1.exportChat);
+    router.get("/chat/visibility", SettingController_1.getVisibility);
+    router.put("/chat/admin-settings", SettingController_1.saveAdminSettings);
+    router.get("/chat/admin-settings", SettingController_1.getAdminSettings);
+    router.get("/chat/attendance", SettingController_1.getAttendanceSettings);
+    router.put("/chat/attendance", SettingController_1.saveAttendanceHtml);
     router.put("/chat/enable", SettingController_1.enableChat);
     router.put("/chat/disable", SettingController_1.disableChat);
     router.get("/chat/canChat", SettingController_1.canWeChat);
@@ -61120,18 +61678,31 @@ var require_app = __commonJS({
     var express_1 = __importDefault(require_express2());
     var path_1 = __importDefault(require("path"));
     var express_session_1 = __importDefault(require_express_session());
+    var require_1 = __importDefault(require("crypto"));
     var auth_1 = __importDefault(require_authRouter());
     var router_1 = __importDefault(require_apiRouter());
     var memorystore_1 = __importDefault(require_memorystore2());
     var paths_1 = require_paths();
-    require_logger2();
+    var config_1 = require_repositoryFactory();
+    var permissions_1 = require_permissions();
+    var attendanceService_1 = require_attendanceService();
+    var logger_1 = __importDefault(require_logger2());
+    var log = (0, logger_1.default)(__filename);
     require_initData();
     var app = (0, express_1.default)();
     exports2.app = app;
     app.set("trust proxy", 1);
     app.get("/healthz", (req, res) => {
-      res.status(200).json({ status: "ok", uptime: process.uptime() });
+      res.status(200).json({ status: "ok", version: APP_VERSION, uptime: process.uptime() });
     });
+    var APP_VERSION = (() => {
+      try {
+        return require(path_1.default.join(paths_1.PROJECT_ROOT, "package.json")).version;
+      } catch {
+        return process.env.APP_VERSION || "3.0.0";
+      }
+    })();
+    var sessionSecret = process.env.SESSION_SECRET || require_1.default.randomBytes(32).toString("hex");
     var sessionStore;
     if (process.env.NODE_ENV === "development")
       sessionStore = new express_session_1.default.MemoryStore();
@@ -61144,7 +61715,7 @@ var require_app = __commonJS({
     }
     var sessionMiddleware = (0, express_session_1.default)({
       // secret from environment; the hardcoded value is only a fallback for local dev
-      secret: process.env.SESSION_SECRET || "My_T00P-Secr@t",
+      secret: sessionSecret,
       resave: false,
       saveUninitialized: false,
       cookie: {
@@ -61160,7 +61731,33 @@ var require_app = __commonJS({
     app.use(sessionMiddleware);
     app.use(express_1.default.json({ limit: "1mb" }));
     app.use(express_1.default.urlencoded({ extended: false }));
-    app.use(express_1.default.static(paths_1.PROJECT_ROOT && path_1.default.join(paths_1.PROJECT_ROOT, "public")));
+    app.use(express_1.default.static(paths_1.PROJECT_ROOT && path_1.default.join(paths_1.PROJECT_ROOT, "public"), {
+      etag: true,
+      lastModified: true,
+      cacheControl: false
+    }));
+    var attendanceCounter = async (req, res) => {
+      const user = req.session?.userInfo;
+      if (!user?.username) {
+        const page2 = (0, attendanceService_1.attendanceEmptyPage)("/login");
+        return res.status(page2.status).set(page2.headers).send(page2.body);
+      }
+      let setting = null;
+      try {
+        const settings = await (0, config_1.getSettingRepository)().get();
+        setting = settings[0] || null;
+      } catch (error) {
+        log.error(error);
+        return res.status(503).set("Content-Type", "text/plain; charset=utf-8").send("storage unavailable");
+      }
+      if (!setting || !(0, permissions_1.canViewAttendance)(setting, user)) {
+        const page2 = (0, attendanceService_1.attendanceDeniedPage)();
+        return res.status(page2.status).set(page2.headers).send(page2.body);
+      }
+      const page = (0, attendanceService_1.renderAttendancePage)(setting.attendanceHtml);
+      res.status(page.status).set(page.headers).send(page.body);
+    };
+    app.get(["/attendance", "/attendance/"], attendanceCounter);
     app.use("/auth", auth_1.default);
     app.use("/api", router_1.default);
     app.use(["/api", "/auth"], (req, res) => {
@@ -61401,7 +61998,9 @@ var require_userHandler = __commonJS({
     var UserDto_1 = require_UserDto();
     var ClientError_1 = require_ClientError();
     var UserCrudService_1 = require_userCrudService();
+    var config_1 = require_repositoryFactory();
     var SocketEvents_1 = require_socketEvents();
+    var permissions_1 = require_permissions();
     var log = (0, logger_1.default)(__filename);
     var cachedUsers = [];
     async function broadcastUsersList(io) {
@@ -61411,7 +62010,20 @@ var require_userHandler = __commonJS({
         const activeUsers = getActiveUsers(io);
         let updatedUsers = dbUsers.map((user) => updateUserStatus(user, activeUsers));
         updatedUsers = updatedUsers.filter((user) => user.status === UserDto_1.userStatuses.online);
-        io.emit(SocketEvents_1.socketEvents.usersWithStatus, updatedUsers);
+        let setting = null;
+        try {
+          const settings = await (0, config_1.getSettingRepository)().get();
+          setting = settings[0] || null;
+        } catch (settingErr) {
+          log.error(settingErr);
+        }
+        const failOpen = setting === null;
+        for (const socket of io.sockets.sockets.values()) {
+          const session = socket.request?.session?.userInfo;
+          const maySeeAll = failOpen || (0, permissions_1.canSeeOnlineUsers)(setting, session);
+          const payload = maySeeAll ? updatedUsers : updatedUsers.filter((u) => u.username === session?.username);
+          socket.emit(SocketEvents_1.socketEvents.usersWithStatus, payload);
+        }
       } catch (err) {
         log.error(err);
       }
@@ -74291,11 +74903,12 @@ var require_www = __commonJS({
     var SocketService_1 = __importDefault(require_socketService());
     var socket_io_1 = require_dist3();
     var logger_1 = __importDefault(require_logger2());
+    var sessionGuard_1 = require_sessionGuard();
     var log = (0, logger_1.default)(__filename);
     var port = normalizePort(process.env.PORT || "3000");
     app_1.app.set("port", port);
     var nodeServer = (0, http_1.createServer)(app_1.app);
-    var io = new socket_io_1.Server(nodeServer, { serveClient: false });
+    var io = new socket_io_1.Server(nodeServer, { serveClient: true });
     var wrap = (middleware) => (socket, next) => middleware(socket.request, {}, next);
     io.use(wrap(app_1.sessionMiddleware));
     io.use((socket, next) => {
@@ -74303,6 +74916,11 @@ var require_www = __commonJS({
       if (session && session.authenticated) {
         if (session.userInfo?.mustChangePassword) {
           return next(new Error("password_change_required"));
+        }
+        if (sessionGuard_1.isRevoked(session.userInfo?.username, session.userInfo?.loginAt)) {
+          session.destroy(() => {
+          });
+          return next(new Error("unauthorized"));
         }
         next();
       } else {
@@ -74314,6 +74932,25 @@ var require_www = __commonJS({
       io.in(sessionId).disconnectSockets();
     };
     exports2.destroySocketSession = destroySocketSession;
+    var kickUserSockets = (username) => {
+      let dropped = 0;
+      for (const socket of io.sockets.sockets.values()) {
+        const sessionUsername = socket.request?.session?.userInfo?.username;
+        if (sessionUsername && sessionUsername.toLowerCase() === String(username || "").toLowerCase()) {
+          try {
+            socket.request.session.destroy(() => {
+            });
+          } catch (err) {
+            log.error(err);
+          }
+          socket.disconnect(true);
+          dropped++;
+        }
+      }
+      log.debug(`kickUserSockets(${username}): dropped ${dropped} socket(s)`);
+      return dropped;
+    };
+    exports2.kickUserSockets = kickUserSockets;
     nodeServer.listen(port);
     nodeServer.on("error", onError);
     nodeServer.on("listening", onListening);

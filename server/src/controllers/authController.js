@@ -93,7 +93,7 @@ const setSession = async (req, user) => {
     }
     // regenerate the session id on login to prevent session fixation
     await new Promise((resolve, reject) => req.session.regenerate((err) => (err ? reject(err) : resolve())));
-    req.session.userInfo = new UserDto_1.SessionUser(user.id, user.username, user.langPref, user.active, user.isAdmin, user.soundPref, user.mustChangePassword === true);
+    req.session.userInfo = new UserDto_1.SessionUser(user.id, user.username, user.langPref, user.active, user.isAdmin, user.soundPref, user.mustChangePassword === true, Date.now());
     req.session.authenticated = true;
     await new Promise((resolve, reject) => req.session.save((err) => (err ? reject(err) : resolve())));
     log.debug(`login sessionId: ${req.sessionID}`);

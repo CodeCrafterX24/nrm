@@ -11,7 +11,9 @@ const logger_1 = __importDefault(require("../logger.js"));
 const UserDto_1 = require("../dto/UserDto.js");
 const ClientError_1 = require("../models/ClientError.js");
 const UserCrudService_1 = require("../services/userCrudService.js");
+const config_1 = require("../config/repositoryFactory.js");
 const SocketEvents_1 = require("./socketEvents.js");
+const permissions_1 = require("../services/permissions.js");
 const log = (0, logger_1.default)(__filename);
 // TODO: needs clarification, why do we need cachedUsers?
 const cachedUsers = [];
@@ -25,9 +27,26 @@ async function broadcastUsersList(io) {
         let updatedUsers = dbUsers.map((user) => updateUserStatus(user, activeUsers));
         // remove all offline user list
         updatedUsers = updatedUsers.filter((user) => user.status === UserDto_1.userStatuses.online);
-        // Broadcast usersWithStatus
-        // log.debug(`Broadcasting onlineUsers ${JSON.stringify(updatedUsers)}`);
-        io.emit(SocketEvents_1.socketEvents.usersWithStatus, updatedUsers);
+        // the admin may hide the online list from regular users, or open it to a
+        // hand-picked list ("selected"); admins always see the full list.
+        // if the setting store hiccups, fail open so chat keeps working.
+        let setting = null;
+        try {
+            const settings = await (0, config_1.getSettingRepository)().get();
+            setting = settings[0] || null;
+        }
+        catch (settingErr) {
+            log.error(settingErr);
+        }
+        const failOpen = setting === null;
+        for (const socket of io.sockets.sockets.values()) {
+            const session = socket.request?.session?.userInfo;
+            const maySeeAll = failOpen || (0, permissions_1.canSeeOnlineUsers)(setting, session);
+            const payload = maySeeAll
+                ? updatedUsers
+                : updatedUsers.filter((u) => u.username === session?.username);
+            socket.emit(SocketEvents_1.socketEvents.usersWithStatus, payload);
+        }
     }
     catch (err) {
         log.error(err);

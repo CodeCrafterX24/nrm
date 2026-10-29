@@ -1,6 +1,6 @@
 {
   "name": "bird-chat",
-  "version": "2.4.1",
+  "version": "3.0.0",
   "private": true,
   "description": "Our Discussion Room — chat server (reconstructed from bundle) + build tooling",
   "main": "index.js",
@@ -21,6 +21,7 @@
     "crypto-js": "^4.2.0",
     "debug": "^4.3.7",
     "dotenv": "^16.4.5",
+    "esbuild": "^0.24.2",
     "express": "^4.21.2",
     "express-rate-limit": "^7.4.1",
     "express-session": "^1.18.1",
@@ -30,7 +31,6 @@
     "winston": "^3.17.0"
   },
   "devDependencies": {
-    "esbuild": "^0.24.2",
     "socket.io-client": "^4.8.1"
   }
 }

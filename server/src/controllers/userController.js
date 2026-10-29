@@ -27,11 +27,13 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.updateSoundPref = exports.updateLangPref = exports.unsuspendUser = exports.suspendUser = exports.removeUser = exports.makeUserRegular = exports.makeUserAdmin = exports.getUsers = exports.getLoggedInUserInfo = exports.changePassword = exports.addUser = void 0;
+exports.updateSoundPref = exports.updateLangPref = exports.kickUser = exports.unsuspendUser = exports.suspendUser = exports.removeUser = exports.makeUserRegular = exports.makeUserAdmin = exports.getUsers = exports.getLoggedInUserInfo = exports.changePassword = exports.addUser = void 0;
 const logger_1 = __importDefault(require("../logger.js"));
 const UserDto_1 = require("../dto/UserDto.js");
 const ClientError_1 = require("../models/ClientError.js");
 const userCrudService = __importStar(require("../services/userCrudService.js"));
+const sessionGuard_1 = require("../services/sessionGuard.js");
+const www_1 = require("../www.js");
 const log = (0, logger_1.default)(__filename);
 const getLoggedInUserInfo = async (req, res) => {
     res.json(req.session.userInfo);
@@ -75,8 +77,13 @@ const getUsers = async (req, res) => {
     try {
         // keeping here to handle errors if any
         const users = await userCrudService.getUsers();
+        // the addon kick panel only lists users who currently hold a live session
+        const loggedIn = await getLoggedInUsernames(req);
         // never leak password hashes to clients
-        res.status(200).json(users.map((u) => (u.toSafeJson ? u.toSafeJson() : u)));
+        res.status(200).json(users.map((u) => ({
+            ...(u.toSafeJson ? u.toSafeJson() : u),
+            loggedIn: loggedIn.has(String(u.username || "").toLowerCase()),
+        })));
     }
     catch (error) {
         if (error instanceof ClientError_1.ClientError) {
@@ -91,6 +98,37 @@ const getUsers = async (req, res) => {
     }
 };
 exports.getUsers = getUsers;
+/** usernames that currently hold at least one valid session — enumerated from
+    the session store, so logins and natural expiries need no extra bookkeeping;
+    kicked-but-not-yet-pruned sessions are excluded via the revocation map */
+function getLoggedInUsernames(req) {
+    return new Promise((resolve) => {
+        const store = req.sessionStore;
+        if (!store || typeof store.all !== "function") {
+            resolve(new Set());
+            return;
+        }
+        store.all((err, sessions) => {
+            const names = new Set();
+            if (!err && sessions) {
+                const list = Array.isArray(sessions) ? sessions : Object.values(sessions);
+                const now = Date.now();
+                for (const s of list) {
+                    const info = s?.userInfo;
+                    if (!s?.authenticated || !info?.username)
+                        continue;
+                    const expires = s.cookie?.expires ? new Date(s.cookie.expires).getTime() : 0;
+                    if (expires && expires <= now)
+                        continue;
+                    if ((0, sessionGuard_1.isRevoked)(info.username, info.loginAt))
+                        continue;
+                    names.add(String(info.username).toLowerCase());
+                }
+            }
+            resolve(names);
+        });
+    });
+}
 const removeUser = async (req, res) => {
     if (!req.session?.userInfo?.isAdmin) {
         res.sendStatus(403);
@@ -181,6 +219,39 @@ const unsuspendUser = async (req, res) => {
     }
 };
 exports.unsuspendUser = unsuspendUser;
+/** POST /api/users/kick {username} — admin forces a full logout of that user:
+    every live socket is dropped and every session created before now dies on
+    the user's next request (see services/sessionGuard.js) */
+const kickUser = async (req, res) => {
+    if (!req.session?.userInfo?.isAdmin) {
+        res.sendStatus(403);
+        return;
+    }
+    const username = typeof req.body?.username === "string" ? req.body.username.trim() : "";
+    if (!username || username.length > 50) {
+        res.status(400).json({ message: "client_error.invalid_error" });
+        return;
+    }
+    if (username.toLowerCase() === String(req.session.userInfo.username || "").toLowerCase()) {
+        res.status(400).json({ message: "client_error.invalid_error" });
+        return;
+    }
+    try {
+        const users = await userCrudService.getUserByUserName(username);
+        if (users.length === 0) {
+            res.status(400).json({ message: "client_error.not_exists_error" });
+            return;
+        }
+        (0, sessionGuard_1.revokeUser)(username);
+        const sockets = (0, www_1.kickUserSockets)(username);
+        log.debug(`User ${username} kicked by admin, dropped ${sockets} socket(s).`);
+        res.status(200).json({ kicked: username, sockets });
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.kickUser = kickUser;
 const changePassword = async (req, res) => {
     try {
         const currentPassword = typeof req.body?.currentPassword === "string" ? req.body.currentPassword : undefined;

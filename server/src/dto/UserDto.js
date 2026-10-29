@@ -73,7 +73,10 @@ class SessionUser {
     isAdmin;
     soundPref;
     mustChangePassword;
-    constructor(id, username, langPref, active, isAdmin, soundPref, mustChangePassword = false) {
+    /** epoch ms of the login that created this session — lets the admin
+        kick revoke only sessions created before the kick */
+    loginAt;
+    constructor(id, username, langPref, active, isAdmin, soundPref, mustChangePassword = false, loginAt = 0) {
         this.id = id;
         this.username = username;
         this.langPref = langPref;
@@ -81,6 +84,7 @@ class SessionUser {
         this.isAdmin = isAdmin;
         this.soundPref = soundPref;
         this.mustChangePassword = mustChangePassword;
+        this.loginAt = loginAt;
     }
 }
 exports.SessionUser = SessionUser;
