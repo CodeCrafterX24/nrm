@@ -1,0 +1,230 @@
+/* Bird-chat addon layer — injected via public/index.html.
+   Scoped under .bca- so it never clashes with the React app styles. */
+
+#bca-root { display: contents; }
+
+@keyframes bca-marquee {
+  from { transform: translateX(var(--bca-from, 100%)); }
+  to   { transform: translateX(var(--bca-to, -100%)); }
+}
+/* keep the app's own hover-to-pause behaviour after we override the animation */
+.marquee-container:hover .marquee-content { animation-play-state: paused !important; }
+
+/* ---------- theme tokens (auto light/dark) ---------- */
+.bca-root {
+  --bca-bg: #ffffff;
+  --bca-bg-soft: #f4f5f7;
+  --bca-card: #ffffff;
+  --bca-text: #1c1e21;
+  --bca-muted: #65676b;
+  --bca-border: #dcdfe3;
+  --bca-accent: #4361ee;
+  --bca-accent-soft: #e8edff;
+  --bca-danger: #d93025;
+  --bca-ok: #0f9d58;
+  --bca-shadow: 0 12px 32px rgba(0, 0, 0, .18);
+}
+.bca-root.bca-dark {
+  --bca-bg: rgba(20, 22, 26, .96);
+  --bca-bg-soft: #1b1e24;
+  --bca-card: #23262d;
+  --bca-text: #e8eaed;
+  --bca-muted: #9aa0a6;
+  --bca-border: #3a3f47;
+  --bca-accent: #7c93ff;
+  --bca-accent-soft: #2b3050;
+  --bca-danger: #ff6b60;
+  --bca-ok: #34c07c;
+  --bca-shadow: 0 12px 32px rgba(0, 0, 0, .55);
+}
+
+/* ---------- floating copy button ---------- */
+.bca-fab {
+  position: fixed;
+  right: 16px;
+  bottom: 96px;
+  z-index: 9000;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 999px;
+  background: var(--bca-accent);
+  color: #fff;
+  font: 600 14px/1 "Segoe UI", "Noto Sans Bengali", system-ui, sans-serif;
+  box-shadow: var(--bca-shadow);
+  cursor: pointer;
+  transition: transform .15s ease, filter .15s ease;
+}
+.bca-fab:hover { transform: translateY(-2px); filter: brightness(1.08); }
+.bca-fab:active { transform: translateY(0); }
+
+/* ---------- navbar copy button (looks native, sits with the other icons) ---------- */
+.bca-navcopy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+}
+.bca-navcopy svg { pointer-events: none; }
+
+/* ---------- popup (drops from the navbar copy button) ---------- */
+.bca-popup {
+  position: fixed;
+  right: 10px;
+  top: 56px;
+  z-index: 9001;
+  width: 300px;
+  max-width: calc(100vw - 24px);
+  background: var(--bca-card);
+  color: var(--bca-text);
+  border: 1px solid var(--bca-border);
+  border-radius: 16px;
+  box-shadow: var(--bca-shadow);
+  padding: 14px;
+  font: 14px/1.45 "Segoe UI", "Noto Sans Bengali", system-ui, sans-serif;
+  animation: bca-pop .18s ease;
+}
+@keyframes bca-pop { from { opacity: 0; transform: translateY(8px); } }
+
+.bca-popup h3 { margin: 0 0 4px; font-size: 15px; font-weight: 700; }
+.bca-popup .bca-sub { margin: 0 0 10px; color: var(--bca-muted); font-size: 12.5px; }
+
+.bca-format {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.bca-format label {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border: 1.5px solid var(--bca-border);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color .12s ease, background .12s ease;
+}
+.bca-format label:hover { background: var(--bca-bg-soft); }
+.bca-format input { margin-top: 2px; accent-color: var(--bca-accent); }
+.bca-format label:has(input:checked) {
+  border-color: var(--bca-accent);
+  background: var(--bca-accent-soft);
+}
+.bca-format .bca-fmt-title { font-weight: 700; font-size: 13.5px; }
+.bca-format .bca-fmt-desc { color: var(--bca-muted); font-size: 12px; }
+
+.bca-actions { display: flex; gap: 8px; }
+.bca-btn {
+  flex: 1;
+  padding: 9px 10px;
+  border: none;
+  border-radius: 10px;
+  font: 600 13.5px/1 inherit;
+  font-family: inherit;
+  cursor: pointer;
+  background: var(--bca-accent);
+  color: #fff;
+  transition: filter .12s ease;
+}
+.bca-btn.ghost {
+  background: var(--bca-bg-soft);
+  color: var(--bca-text);
+  border: 1px solid var(--bca-border);
+}
+.bca-btn:hover { filter: brightness(1.08); }
+.bca-btn[disabled] { opacity: .6; cursor: wait; }
+
+.bca-close {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  border: none;
+  background: none;
+  color: var(--bca-muted);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+
+/* ---------- toast ---------- */
+.bca-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  z-index: 100002;
+  background: var(--bca-text);
+  color: var(--bca-bg);
+  padding: 10px 18px;
+  border-radius: 999px;
+  font: 600 13.5px/1 "Segoe UI", "Noto Sans Bengali", system-ui, sans-serif;
+  box-shadow: var(--bca-shadow);
+  animation: bca-pop .2s ease;
+}
+.bca-toast.err { background: var(--bca-danger); color: #fff; }
+
+/* ---------- forced password-change modal ---------- */
+.bca-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(8, 10, 14, .62);
+  backdrop-filter: blur(4px);
+}
+.bca-modal {
+  width: 380px;
+  max-width: 100%;
+  background: var(--bca-card);
+  color: var(--bca-text);
+  border-radius: 18px;
+  border: 1px solid var(--bca-border);
+  box-shadow: var(--bca-shadow);
+  padding: 22px;
+  font: 14px/1.5 "Segoe UI", "Noto Sans Bengali", system-ui, sans-serif;
+  animation: bca-pop .2s ease;
+}
+.bca-modal .bca-shield {
+  width: 52px; height: 52px;
+  border-radius: 14px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 26px;
+  background: var(--bca-accent-soft);
+  margin-bottom: 12px;
+}
+.bca-modal h2 { margin: 0 0 6px; font-size: 18px; font-weight: 800; }
+.bca-modal .bca-sub { margin: 0 0 16px; color: var(--bca-muted); font-size: 13px; }
+.bca-field { margin-bottom: 12px; }
+.bca-field label { display: block; font-size: 12.5px; font-weight: 700; margin-bottom: 5px; color: var(--bca-muted); }
+.bca-field input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1.5px solid var(--bca-border);
+  border-radius: 10px;
+  background: var(--bca-bg);
+  color: var(--bca-text);
+  font: 15px inherit;
+  outline: none;
+  transition: border-color .12s ease;
+}
+.bca-field input:focus { border-color: var(--bca-accent); }
+.bca-modal .bca-err {
+  display: none;
+  margin: 0 0 12px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bca-danger) 12%, transparent);
+  color: var(--bca-danger);
+  font-size: 13px;
+  font-weight: 600;
+}
+.bca-modal .bca-err.show { display: block; }
+.bca-modal .bca-btn { width: 100%; padding: 11px; font-size: 14.5px; }
