@@ -44,6 +44,10 @@ function socketService(io) {
         socket.on(SocketEvents_1.socketEvents.updateNotice, (callback) => {
             (0, chatHandler_1.handleUpdateNotice)(socket, callback);
         });
+        // Event listener for updating the fullscreen login notice
+        socket.on(SocketEvents_1.socketEvents.updateFsNotice, (callback) => {
+            (0, chatHandler_1.handleUpdateFsNotice)(socket, callback);
+        });
         // Event listener for updating user status
         socket.on(SocketEvents_1.socketEvents.changeStatus, (user, callback) => {
             (0, userHandler_1.handleChangeStatus)(user, socket, callback);

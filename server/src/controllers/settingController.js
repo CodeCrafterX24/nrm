@@ -194,6 +194,43 @@ const updateNotice = async (req, res) => {
     }
 };
 exports.updateNotice = updateNotice;
+/** logged-in read of the fullscreen login notice (raw html/css/js, admin-authored) */
+const getFsNotice = async (req, res) => {
+    try {
+        const setting = await getSetting();
+        // raw stored docs (disk storage) predate these fields — coerce instead of
+        // letting JSON.stringify drop them as undefined
+        res.status(200).json({ notice: setting.fsNotice || "", updatedAt: setting.fsNoticeUpdatedAt || "" });
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.getFsNotice = getFsNotice;
+/** admin-only write of the fullscreen notice — stored raw (like the attendance
+ * html): only admins can write it and only logged-in users can read it; the
+ * addon renders it in a dedicated fullscreen div after every login */
+const updateFsNotice = async (req, res) => {
+    if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+    log.debug("updating fullscreen notice");
+    try {
+        const raw = typeof req.body?.notice === "string" ? req.body.notice : "";
+        if (raw.length > Setting_1.SETTING_LIMITS.fsNotice)
+            return res.status(400).json({ errorMessage: "client_error.too_large_error" });
+        const repository = (0, config_1.getSettingRepository)();
+        const setting = await getSetting();
+        setting.fsNotice = raw;
+        setting.fsNoticeUpdatedAt = new Date().toISOString();
+        await repository.update(setting);
+        log.info(`fullscreen notice saved (${raw.length} chars)`);
+        res.sendStatus(200);
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.updateFsNotice = updateFsNotice;
 const enableChat = async (req, res) => {
     if (!req.session?.userInfo?.isAdmin)
         return res.sendStatus(403);

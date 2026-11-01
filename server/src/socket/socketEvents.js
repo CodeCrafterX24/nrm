@@ -8,6 +8,7 @@ exports.socketEvents = {
     deleteChat: "deleteChat",
     chatDeleted: "chatDeleted",
     updateNotice: "updateNotice",
+    updateFsNotice: "updateFsNotice",
     chatMessage: "chatMessage",
     editMessage: "editMessage",
     editedMessage: "editedMessage",

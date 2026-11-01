@@ -59154,6 +59154,8 @@ var require_Setting = __commonJS({
     var SETTING_LIMITS = {
       /** UI-editable html for the attendance counter page (raw html, not sanitized) */
       attendanceHtml: 3e5,
+      /** UI-editable html/css/js for the fullscreen login notice (raw, not sanitized) */
+      fsNotice: 1e5,
       /** one username entry */
       username: 50,
       /** members of a selected-users list */
@@ -59277,6 +59279,10 @@ var require_Setting = __commonJS({
       attendanceSelected;
       /** raw, admin-editiable html rendered by GET /attendance */
       attendanceHtml;
+      /** raw, admin-editable html/css/js shown fullscreen after every login */
+      fsNotice;
+      /** ISO timestamp of the last fullscreen-notice save ("" = never) */
+      fsNoticeUpdatedAt;
       constructor(json = {}) {
         super(json);
         this.notice = json.notice || "";
@@ -59295,6 +59301,8 @@ var require_Setting = __commonJS({
         this.attendanceViewMode = normalizeMode(json.attendanceViewMode, "admin") === "all" ? "admin" : normalizeMode(json.attendanceViewMode, "admin");
         this.attendanceSelected = normalizeUsernames(json.attendanceSelected);
         this.attendanceHtml = typeof json.attendanceHtml === "string" ? json.attendanceHtml.slice(0, SETTING_LIMITS.attendanceHtml) : "";
+        this.fsNotice = typeof json.fsNotice === "string" ? json.fsNotice.slice(0, SETTING_LIMITS.fsNotice) : "";
+        this.fsNoticeUpdatedAt = typeof json.fsNoticeUpdatedAt === "string" ? json.fsNoticeUpdatedAt : "";
       }
     };
     exports2.Setting = Setting;
@@ -59686,6 +59694,35 @@ var require_settingController = __commonJS({
       }
     };
     exports2.updateNotice = updateNotice;
+    var getFsNotice = async (req, res) => {
+      try {
+        const setting = await getSetting();
+        res.status(200).json({ notice: setting.fsNotice || "", updatedAt: setting.fsNoticeUpdatedAt || "" });
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.getFsNotice = getFsNotice;
+    var updateFsNotice = async (req, res) => {
+      if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+      log.debug("updating fullscreen notice");
+      try {
+        const raw = typeof req.body?.notice === "string" ? req.body.notice : "";
+        if (raw.length > Setting_1.SETTING_LIMITS.fsNotice)
+          return res.status(400).json({ errorMessage: "client_error.too_large_error" });
+        const repository = (0, config_1.getSettingRepository)();
+        const setting = await getSetting();
+        setting.fsNotice = raw;
+        setting.fsNoticeUpdatedAt = (/* @__PURE__ */ new Date()).toISOString();
+        await repository.update(setting);
+        log.info(`fullscreen notice saved (${raw.length} chars)`);
+        res.sendStatus(200);
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.updateFsNotice = updateFsNotice;
     var enableChat = async (req, res) => {
       if (!req.session?.userInfo?.isAdmin)
         return res.sendStatus(403);
@@ -59978,6 +60015,8 @@ var require_apiRouter = __commonJS({
     router.post("/chat/getMessages", ChatController_1.getMessages);
     router.post("/chat/getMissingMessages", ChatController_1.getMissingMessages);
     router.put("/chat/updateNotice", SettingController_1.updateNotice);
+    router.get("/chat/getFsNotice", SettingController_1.getFsNotice);
+    router.put("/chat/updateFsNotice", SettingController_1.updateFsNotice);
     router.get("/chat/download-json", SettingController_1.downloadChat);
     router.get("/chat/download", SettingController_1.downloadFormatted);
     router.get("/chat/export", ChatController_1.exportChat);
@@ -61781,6 +61820,7 @@ var require_socketEvents = __commonJS({
       deleteChat: "deleteChat",
       chatDeleted: "chatDeleted",
       updateNotice: "updateNotice",
+      updateFsNotice: "updateFsNotice",
       chatMessage: "chatMessage",
       editMessage: "editMessage",
       editedMessage: "editedMessage",
@@ -61810,6 +61850,7 @@ var require_chatHandler = __commonJS({
     exports2.handleDeleteMessage = handleDeleteMessage;
     exports2.handleDeleteChat = handleDeleteChat;
     exports2.handleUpdateNotice = handleUpdateNotice;
+    exports2.handleUpdateFsNotice = handleUpdateFsNotice;
     var config_1 = require_repositoryFactory();
     var logger_1 = __importDefault(require_logger2());
     var ClientError_1 = require_ClientError();
@@ -61974,6 +62015,19 @@ var require_chatHandler = __commonJS({
           return;
         }
         socket.broadcast.emit(SocketEvents_1.socketEvents.updateNotice);
+        safeCallback(callback, JSON.stringify({ success: true }));
+      } catch (err) {
+        log.error(err);
+        safeCallback(callback, JSON.stringify({ success: false }));
+      }
+    }
+    async function handleUpdateFsNotice(socket, callback) {
+      try {
+        if (!socket.request.session.userInfo?.isAdmin) {
+          safeCallback(callback, JSON.stringify({ success: false, error: "client_error.access_denied" }));
+          return;
+        }
+        socket.broadcast.emit(SocketEvents_1.socketEvents.updateFsNotice);
         safeCallback(callback, JSON.stringify({ success: true }));
       } catch (err) {
         log.error(err);
@@ -62182,6 +62236,9 @@ var require_socketService = __commonJS({
         });
         socket.on(SocketEvents_1.socketEvents.updateNotice, (callback) => {
           (0, chatHandler_1.handleUpdateNotice)(socket, callback);
+        });
+        socket.on(SocketEvents_1.socketEvents.updateFsNotice, (callback) => {
+          (0, chatHandler_1.handleUpdateFsNotice)(socket, callback);
         });
         socket.on(SocketEvents_1.socketEvents.changeStatus, (user, callback) => {
           (0, userHandler_1.handleChangeStatus)(user, socket, callback);

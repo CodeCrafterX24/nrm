@@ -10,6 +10,7 @@ exports.handleReactMessage = handleReactMessage;
 exports.handleDeleteMessage = handleDeleteMessage;
 exports.handleDeleteChat = handleDeleteChat;
 exports.handleUpdateNotice = handleUpdateNotice;
+exports.handleUpdateFsNotice = handleUpdateFsNotice;
 const config_1 = require("../config/repositoryFactory.js");
 const logger_1 = __importDefault(require("../logger.js"));
 const ClientError_1 = require("../models/ClientError.js");
@@ -221,3 +222,18 @@ async function handleUpdateNotice(socket, callback) {
         safeCallback(callback, JSON.stringify({ success: false }));
     }
 }
+ async function handleUpdateFsNotice(socket, callback) {
+     try {
+         // only admins may trigger the fullscreen-notice refresh broadcast
+         if (!socket.request.session.userInfo?.isAdmin) {
+             safeCallback(callback, JSON.stringify({ success: false, error: "client_error.access_denied" }));
+             return;
+         }
+         socket.broadcast.emit(SocketEvents_1.socketEvents.updateFsNotice);
+         safeCallback(callback, JSON.stringify({ success: true }));
+     }
+     catch (err) {
+         log.error(err);
+         safeCallback(callback, JSON.stringify({ success: false }));
+     }
+ }

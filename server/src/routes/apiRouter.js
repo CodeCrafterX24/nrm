@@ -58,6 +58,9 @@ router.put("/chat/saveFrequentSymbols", SettingController_1.saveFrequentSymbols)
 router.post("/chat/getMessages", ChatController_1.getMessages);
 router.post("/chat/getMissingMessages", ChatController_1.getMissingMessages);
 router.put("/chat/updateNotice", SettingController_1.updateNotice);
+// fullscreen login notice — read by any logged-in user, written by admins only
+router.get("/chat/getFsNotice", SettingController_1.getFsNotice);
+router.put("/chat/updateFsNotice", SettingController_1.updateFsNotice);
 router.get("/chat/download-json", SettingController_1.downloadChat);
 router.get("/chat/download", SettingController_1.downloadFormatted);
 // full-history export available to every logged-in user (unless the admin

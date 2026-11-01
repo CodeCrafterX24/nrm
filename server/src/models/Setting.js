@@ -26,6 +26,8 @@ exports.PERMISSION_MODES = PERMISSION_MODES;
 const SETTING_LIMITS = {
     /** UI-editable html for the attendance counter page (raw html, not sanitized) */
     attendanceHtml: 300000,
+    /** UI-editable html/css/js for the fullscreen login notice (raw, not sanitized) */
+    fsNotice: 100000,
     /** one username entry */
     username: 50,
     /** members of a selected-users list */
@@ -160,6 +162,10 @@ class Setting extends BaseModel_1.BaseModel {
     attendanceSelected;
     /** raw, admin-editiable html rendered by GET /attendance */
     attendanceHtml;
+    /** raw, admin-editable html/css/js shown fullscreen after every login */
+    fsNotice;
+    /** ISO timestamp of the last fullscreen-notice save ("" = never) */
+    fsNoticeUpdatedAt;
     constructor(json = {}) {
         super(json);
         this.notice = json.notice || "";
@@ -188,6 +194,10 @@ class Setting extends BaseModel_1.BaseModel {
         this.attendanceHtml = typeof json.attendanceHtml === "string"
             ? json.attendanceHtml.slice(0, SETTING_LIMITS.attendanceHtml)
             : "";
+        this.fsNotice = typeof json.fsNotice === "string"
+            ? json.fsNotice.slice(0, SETTING_LIMITS.fsNotice)
+            : "";
+        this.fsNoticeUpdatedAt = typeof json.fsNoticeUpdatedAt === "string" ? json.fsNoticeUpdatedAt : "";
     }
 }
 exports.Setting = Setting;
