@@ -26,8 +26,12 @@ exports.PERMISSION_MODES = PERMISSION_MODES;
 const SETTING_LIMITS = {
     /** UI-editable html for the attendance counter page (raw html, not sanitized) */
     attendanceHtml: 300000,
+    /** shared note shown on the attendance page (plain text, not sanitized) */
+    attendanceNote: 100000,
     /** UI-editable html/css/js for the fullscreen login notice (raw, not sanitized) */
     fsNotice: 100000,
+    /** fullscreen-notice confirm button label (plain text, short) */
+    fsNoticeOkLabel: 60,
     /** one username entry */
     username: 50,
     /** members of a selected-users list */
@@ -162,10 +166,18 @@ class Setting extends BaseModel_1.BaseModel {
     attendanceSelected;
     /** raw, admin-editiable html rendered by GET /attendance */
     attendanceHtml;
+    /** shared plain-text note shown on the attendance page (admin + selected users) */
+    attendanceNote;
     /** raw, admin-editable html/css/js shown fullscreen after every login */
     fsNotice;
     /** ISO timestamp of the last fullscreen-notice save ("" = never) */
     fsNoticeUpdatedAt;
+    /** custom text for the fullscreen-notice confirm button ("" = default) */
+    fsNoticeOkLabel;
+    /** where new chat messages persist: "gist" (durable, slower) | "memory"
+        (server-local, fast — lost on restart/redeploy). User+Setting always
+        persist in the gist regardless. */
+    messageStoreMode;
     constructor(json = {}) {
         super(json);
         this.notice = json.notice || "";
@@ -194,10 +206,15 @@ class Setting extends BaseModel_1.BaseModel {
         this.attendanceHtml = typeof json.attendanceHtml === "string"
             ? json.attendanceHtml.slice(0, SETTING_LIMITS.attendanceHtml)
             : "";
+        this.attendanceNote = typeof json.attendanceNote === "string"
+            ? json.attendanceNote.slice(0, SETTING_LIMITS.attendanceNote)
+            : "";
         this.fsNotice = typeof json.fsNotice === "string"
             ? json.fsNotice.slice(0, SETTING_LIMITS.fsNotice)
             : "";
         this.fsNoticeUpdatedAt = typeof json.fsNoticeUpdatedAt === "string" ? json.fsNoticeUpdatedAt : "";
+        this.fsNoticeOkLabel = typeof json.fsNoticeOkLabel === "string" ? json.fsNoticeOkLabel.slice(0, SETTING_LIMITS.fsNoticeOkLabel) : "";
+        this.messageStoreMode = json.messageStoreMode === "gist" ? "gist" : "memory";
     }
 }
 exports.Setting = Setting;

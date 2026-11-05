@@ -57,6 +57,10 @@ router.post("/chat/restoreFrequentSymbols", SettingController_1.restoreFrequentS
 router.put("/chat/saveFrequentSymbols", SettingController_1.saveFrequentSymbols);
 router.post("/chat/getMessages", ChatController_1.getMessages);
 router.post("/chat/getMissingMessages", ChatController_1.getMissingMessages);
+// REST twin of the socket reactMessage — the addon picker sends through this
+// (same http path as the app's other calls); UI updates via the reactedMessage
+// broadcast on the app's own socket
+router.post("/chat/react", ChatController_1.reactMessage);
 router.put("/chat/updateNotice", SettingController_1.updateNotice);
 // fullscreen login notice — read by any logged-in user, written by admins only
 router.get("/chat/getFsNotice", SettingController_1.getFsNotice);
@@ -72,7 +76,12 @@ router.put("/chat/admin-settings", SettingController_1.saveAdminSettings);
 router.get("/chat/admin-settings", SettingController_1.getAdminSettings);
 // attendance counter — the admin edits the raw html, GET /attendance renders it
 router.get("/chat/attendance", SettingController_1.getAttendanceSettings);
+// message-store switch status (admin): where new messages currently persist
+router.get("/chat/messageStoreMode", SettingController_1.getMessageStoreMode);
 router.put("/chat/attendance", SettingController_1.saveAttendanceHtml);
+// shared note on the attendance page — same access as the page itself
+router.get("/chat/attendance-note", SettingController_1.getAttendanceNote);
+router.put("/chat/attendance-note", SettingController_1.saveAttendanceNote);
 router.put("/chat/enable", SettingController_1.enableChat);
 router.put("/chat/disable", SettingController_1.disableChat);
 router.get("/chat/canChat", SettingController_1.canWeChat);

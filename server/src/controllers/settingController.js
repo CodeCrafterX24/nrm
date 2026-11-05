@@ -109,6 +109,44 @@ const saveAttendanceHtml = async (req, res) => {
     }
 };
 exports.saveAttendanceHtml = saveAttendanceHtml;
+/**
+ * Shared note on the attendance page — same access as the page itself:
+ * readable AND writable by admins + the "selected" list (owner request).
+ * Stored in the Setting document (settings gist) — survives redeploys.
+ */
+const getAttendanceNote = async (req, res) => {
+    try {
+        const setting = await getSetting();
+        const user = req.session?.userInfo;
+        if (!(0, permissions_1.canViewAttendance)(setting, user))
+            return res.sendStatus(403);
+        res.status(200).json({ note: typeof setting.attendanceNote === "string" ? setting.attendanceNote : "" });
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.getAttendanceNote = getAttendanceNote;
+const saveAttendanceNote = async (req, res) => {
+    try {
+        const setting = await getSetting();
+        const user = req.session?.userInfo;
+        if (!(0, permissions_1.canViewAttendance)(setting, user))
+            return res.sendStatus(403);
+        const note = (0, attendanceService_1.validateAttendanceNote)(req.body?.note);
+        if (note === null)
+            return res.status(400).json({ errorMessage: "client_error.too_large_error" });
+        const repository = (0, config_1.getSettingRepository)();
+        setting.attendanceNote = note;
+        await repository.update(setting);
+        log.info(`attendance note saved (${note.length} chars)`);
+        res.status(200).json({ note });
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.saveAttendanceNote = saveAttendanceNote;
 const logger_1 = __importDefault(require("../logger.js"));
 const ClientError_1 = require("../models/ClientError.js");
 const ChatService_1 = require("../services/chatService.js");
@@ -118,6 +156,8 @@ const SettingService_1 = require("../services/settingService.js");
 const htmlSanitizer_1 = require("../services/htmlSanitizer.js");
 const permissions_1 = require("../services/permissions.js");
 const attendanceService_1 = require("../services/attendanceService.js");
+// the message-store switch changes which repo getMessageRepository() returns
+const repositoryFactoryRef = require("../config/repositoryFactory.js");
 const log = (0, logger_1.default)(__filename);
 /** the settings store may still be initializing at boot — fail softly instead of crashing */
 async function getSetting() {
@@ -200,7 +240,12 @@ const getFsNotice = async (req, res) => {
         const setting = await getSetting();
         // raw stored docs (disk storage) predate these fields — coerce instead of
         // letting JSON.stringify drop them as undefined
-        res.status(200).json({ notice: setting.fsNotice || "", updatedAt: setting.fsNoticeUpdatedAt || "" });
+        res.status(200).json({
+            notice: setting.fsNotice || "",
+            updatedAt: setting.fsNoticeUpdatedAt || "",
+            okLabel: setting.fsNoticeOkLabel || "",
+            messageStoreMode: setting.messageStoreMode || "memory",
+        });
     }
     catch (error) {
         handleError(error, res);
@@ -216,12 +261,23 @@ const updateFsNotice = async (req, res) => {
     log.debug("updating fullscreen notice");
     try {
         const raw = typeof req.body?.notice === "string" ? req.body.notice : "";
+        const okLabel = typeof req.body?.okLabel === "string" ? req.body.okLabel.trim().slice(0, Setting_1.SETTING_LIMITS.fsNoticeOkLabel) : "";
         if (raw.length > Setting_1.SETTING_LIMITS.fsNotice)
             return res.status(400).json({ errorMessage: "client_error.too_large_error" });
         const repository = (0, config_1.getSettingRepository)();
         const setting = await getSetting();
         setting.fsNotice = raw;
+        setting.fsNoticeOkLabel = okLabel;
         setting.fsNoticeUpdatedAt = new Date().toISOString();
+        // the message-store switch rides along with every fs-notice save —
+        // the admin panel toggles it through this endpoint
+        if (req.body?.messageStoreMode === "memory" || req.body?.messageStoreMode === "gist") {
+            const mode = req.body.messageStoreMode;
+            const changed = setting.messageStoreMode !== mode;
+            setting.messageStoreMode = mode;
+            if (changed)
+                repositoryFactoryRef.applyMessageStoreMode(mode);
+        }
         await repository.update(setting);
         log.info(`fullscreen notice saved (${raw.length} chars)`);
         res.sendStatus(200);
@@ -263,6 +319,22 @@ const disableChat = async (req, res) => {
     }
 };
 exports.disableChat = disableChat;
+/** which backend new messages currently go to (admin switch display) */
+const getMessageStoreMode = async (req, res) => {
+    if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+    try {
+        const setting = await getSetting();
+        res.status(200).json({
+            messageStoreMode: setting.messageStoreMode === "gist" ? "gist" : "memory",
+            live: repositoryFactoryRef.currentMessageStoreMode(),
+        });
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.getMessageStoreMode = getMessageStoreMode;
 const canWeChat = async (req, res) => {
     try {
         const setting = await getSetting();

@@ -63,7 +63,7 @@
         "client_error.not_exists_error": "User not found",
       },
       copyTitle: "Copy all messages",
-      copySub: "The whole conversation — names, times and replies included",
+      copySub: "",
       fmtTxt: "📝 Clean note (TXT)",
       fmtTxtDesc: "HTML stripped, ready for a notebook",
       fmtHtml: "🎨 As shown (HTML)",
@@ -102,8 +102,11 @@
       tabAttendance: "Attendance counter",
       attViewLabel: "Who may open the attendance page?",
       attLinkLabel: "Attendance link",
+      attOpenPage: "Attendance & notepad",
       attEditorLabel: "HTML code of the page",
-      attHint: "This link opens ONLY the code you save here — the chat UI is not included. The code is stored in the settings gist, so it survives restarts and redeploys.",
+      attNoteLabel: "Shared note (visible on the attendance page)",
+      attNoteSave: "Save note",
+      attHint: "",
       attSave: "Save code",
       attSaving: "Saving…",
       attRestore: "Restore starter page",
@@ -169,7 +172,7 @@
         "client_error.not_exists_error": "ইউজার পাওয়া যায়নি",
       },
       copyTitle: "সব মেসেজ কপি করুন",
-      copySub: "পুরো কথোপকথন — নাম, সময় ও উত্তরসহ",
+      copySub: "",
       fmtTxt: "📝 সুন্দর নোট (TXT)",
       fmtTxtDesc: "HTML বাদ, নোট-বুকে রাখার উপযোগী",
       fmtHtml: "🎨 যেমন দেখায় (HTML)",
@@ -208,8 +211,11 @@
       tabAttendance: "হাজিরা কাউন্টার",
       attViewLabel: "হাজিরা পেজ কারা খুলতে পারবে?",
       attLinkLabel: "হাজিরা লিংক",
+      attOpenPage: "হাজিরা ও নোটপ্যাড",
       attEditorLabel: "পেজের HTML কোড",
-      attHint: "এই লিংকে শুধু এখানে সেভ করা কোডটাই দেখা যাবে — চ্যাটের কিছুই থাকবে না। কোডটা সেটিংস গিস্টে সেভ হয়, তাই রিস্টার্ট বা রিডিপ্লয়েও থাকবে।",
+      attNoteLabel: "শেয়ার্ড নোট (হাজিরা পেজে দেখা যাবে)",
+      attNoteSave: "নোট সেভ করুন",
+      attHint: "",
       attSave: "কোড সেভ করুন",
       attSaving: "সেভ হচ্ছে…",
       attRestore: "শুরুর পেজ ফিরিয়ে আনুন",
@@ -527,7 +533,9 @@
         <button class="bca-btn ghost" data-act="download" type="button"></button>
       </div>`;
     pop.querySelector("h3").textContent = s.copyTitle;
-    pop.querySelector(".bca-sub").textContent = s.copySub;
+    const subEl = pop.querySelector(".bca-sub");
+    subEl.textContent = s.copySub || "";
+    subEl.style.display = s.copySub ? "" : "none"; // খালি হলে লুকানো — বাটনের জায়গা নষ্ট নয়
     const titles = pop.querySelectorAll(".bca-fmt-title");
     const descs = pop.querySelectorAll(".bca-fmt-desc");
     titles[0].textContent = s.fmtTxt;
@@ -820,7 +828,16 @@
     renderChips();
     loadAccounts();
 
-    return { el: box, values: () => [...state], onChange: (fn) => handlers.push(fn) };
+    return {
+      el: box,
+      values: () => [...state],
+      onChange: (fn) => handlers.push(fn),
+      setValues: (names) => {
+        for (const name of names) state.add(String(name).trim());
+        renderChips();
+        loadAccounts(); // refresh the checkbox list too (kept in userPicker scope)
+      },
+    };
   }
 
   async function showAdminPanel() {
@@ -1086,7 +1103,8 @@
     pane.querySelector(".bca-att-link-label").textContent = s.attLinkLabel;
     pane.querySelector(".bca-att-editor-label").textContent = s.attEditorLabel;
     const noteEl = pane.querySelector(".bca-att-note");
-    noteEl.textContent = s.attHint;
+    noteEl.textContent = s.attHint || "";
+    noteEl.style.display = s.attHint ? "" : "none"; // hint কাটা → এলিমেন্ট লুকানো (কোনো ফাঁকা জায়গা নয়)
 
     const url = location.origin + "/attendance";
     const link = pane.querySelector(".bca-att-link");
@@ -1114,6 +1132,21 @@
 
     const picker = userPicker(s.pickerAttendanceTitle, s.pickerPlaceholder, features.attendanceSelected || []);
     pane.querySelector(".bca-picker-slot").appendChild(picker.el);
+
+    // the selected list lives behind the admin API — load it so the picker
+    // shows the CURRENTLY saved users when the panel opens (owner report:
+    // ticks vanished after reopening). Also re-syncs the mode radio.
+    (async () => {
+      try {
+        const res = await fetch("/api/chat/admin-settings", { credentials: "same-origin" });
+        if (!res.ok) return;
+        const data = await res.json().catch(() => null);
+        if (!data) return;
+        if (Array.isArray(data.attendanceSelected) && data.attendanceSelected.length)
+          picker.setValues(data.attendanceSelected);
+        if (data.attendanceMode) checkRadio(seg, data.attendanceMode);
+      } catch { /* transient — picker starts empty */ }
+    })();
 
     const paintCount = () => {
       count.textContent = `${editor.value.length.toLocaleString()} / ${limit.toLocaleString()}`;
@@ -1153,6 +1186,7 @@
         if (next) {
           features.attendanceMode = next.attendanceMode === "selected" ? "selected" : "admin";
           if (typeof next.canViewAttendance === "boolean") features.canViewAttendance = next.canViewAttendance;
+          if (typeof next.hasAttendanceHtml === "boolean") features.hasAttendanceHtml = next.hasAttendanceHtml;
         }
         toast(s.saved);
       } catch {
@@ -1563,7 +1597,7 @@
   // 2e) custom reactions: a "+" at the far right of the app's quick-reaction
   //     row opens a full picker; selecting an emoji reacts on that message
   //     via the addon's own socket.io connection (same session cookie).
-  //     The official client is loaded from /socket.io/socket.io.js because
+  //     The official client is vendored at /addons/socket.io.min.js because
   //     the minified app does not expose its `io` globally.
   // ==================================================================
   let reactionSock = null;
@@ -1576,7 +1610,7 @@
     if (socketClientLoading) return socketClientLoading;
     socketClientLoading = new Promise((resolve) => {
       const sc = document.createElement("script");
-      sc.src = "/socket.io/socket.io.js";
+      sc.src = "/addons/socket.io.min.js"; // vendored client — /socket.io/socket.io.js is NOT served by the Render/CF builds (client-dist not deployed there)
       sc.onload = () => resolve(window.io || null);
       sc.onerror = () => resolve(null);
       document.head.appendChild(sc);
@@ -1634,6 +1668,7 @@
   }
 
   async function reactOnMessage(bubble, emoji) {
+    return; // dead path — tray-picker owns reactions (REST-first, shared surface)
     const id = parseInt(String(bubble.id || "").replace("message-", ""), 10);
     if (!Number.isFinite(id)) return;
     const username = meUser?.username;
@@ -1740,6 +1775,7 @@
 
   /** the "+" sits at the far right of the 8-emoji quick-reaction row */
   function ensureReactionPlus() {
+    return; // the standalone tray-picker addon owns the "+" now (one picker, no legacy socket)
     if (!loggedIn) return;
     document.querySelectorAll(".dropdown-menu.context-menu.show").forEach((menu) => {
       if (menu.querySelector(".bca-react-plus")) return;
@@ -1772,13 +1808,16 @@
     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-clipboard" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zM9.5 0h-3a1.5 1.5 0 0 0-1.5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0z"/></svg>';
   const SHIELD_SVG =
     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-shield-lock" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.338 1.59a61 61 0 0 0-2.837.856.48.48 0 0 0-.328.39c-.554 4.157.726 7.19 2.253 9.188a10.7 10.7 0 0 0 2.287 2.233c.346.244.652.42.893.533q.18.085.293.118a1 1 0 0 0 .101.025 1 1 0 0 0 .1-.025q.114-.034.294-.118c.24-.113.547-.29.893-.533a10.7 10.7 0 0 0 2.287-2.233c1.527-1.997 2.807-5.031 2.253-9.188a.48.48 0 0 0-.328-.39c-.651-.213-1.75-.56-2.837-.855C9.552 1.29 8.531 1.067 8 1.067c-.53 0-1.552.223-2.662.524zM5.072.56C6.157.265 7.31 0 8 0s1.843.265 2.928.56c1.11.3 2.229.655 2.887.87a1.54 1.54 0 0 1 1.044 1.262c.596 4.477-.787 7.795-2.465 9.99a11.8 11.8 0 0 1-2.517 2.453 7 7 0 0 1-1.048.625c-.28.132-.581.24-.829.24s-.548-.108-.829-.24a7 7 0 0 1-1.048-.625 11.8 11.8 0 0 1-2.517-2.453C1.928 10.487.545 7.169 1.141 2.692A1.54 1.54 0 0 1 2.185 1.43 63 63 0 0 1 5.072.56"/><path d="M9.5 6.5a1.5 1.5 0 0 1-1 1.415l.385 1.99a.5.5 0 0 1-.491.595h-.788a.5.5 0 0 1-.49-.595l.384-1.99a1.5 1.5 0 1 1 2-1.415z"/></svg>';
+  const ATTENDANCE_SVG =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-clipboard2-check" viewBox="0 0 16 16" aria-hidden="true"><path d="M9.5 0a.5.5 0 0 1 .5.5.5.5 0 0 0 .5.5.5.5 0 0 1 .5.5V2a.5.5 0 0 1-.5.5h-5A.5.5 0 0 1 5 2v-.5a.5.5 0 0 1 .5-.5.5.5 0 0 0 .5-.5.5.5 0 0 1 .5-.5z"/><path d="M3 2.5a.5.5 0 0 1 .5-.5H4a.5.5 0 0 0 0-1h-.5A1.5 1.5 0 0 0 2 2.5v12A1.5 1.5 0 0 0 3.5 16h9a1.5 1.5 0 0 0 1.5-1.5v-12A1.5 1.5 0 0 0 12.5 1H12a.5.5 0 0 0 0 1h.5a.5.5 0 0 1 .5.5v12a.5.5 0 0 1-.5.5h-9a.5.5 0 0 1-.5-.5z"/><path d="M10.854 7.854a.5.5 0 0 0-.708-.708L7.5 9.793 6.354 8.646a.5.5 0 1 0-.708.708l1.5 1.5a.5.5 0 0 0 .708 0z"/></svg>';
 
   let navBtn = null;
   let adminBtn = null;
+  let attBtn = null;
 
   function refreshCopyUi() {
     const s = S();
-    for (const [btn, label] of [[navBtn, s.menuCopy], [adminBtn, s.adminMenu]]) {
+    for (const [btn, label] of [[navBtn, s.menuCopy], [adminBtn, s.adminMenu], [attBtn, s.attOpenPage]]) {
       if (btn && document.contains(btn)) {
         btn.title = label;
         btn.setAttribute("aria-label", label);
@@ -1851,8 +1890,56 @@
     if (!wantAdmin && adminBtn) { adminBtn.remove(); adminBtn = null; }
     if (wantAdmin && adminBtn && adminBtn.parentElement !== group) group.appendChild(adminBtn);
 
+    // attendance page: show a navbar link to EVERYONE who has permission
+    // (admins always; "selected" users when the admin grants it — features
+    // come from /api/chat/visibility, refreshed by the 1.2 s poll, so a
+    // revoked user loses the icon automatically). Opens in a NEW TAB (the
+    // attendance page is a standalone page, not part of the chat SPA).
+    const wantAtt = loggedIn && features.supported && features.canViewAttendance && !!features.hasAttendanceHtml;
+    if (wantAtt && !attBtn) {
+      attBtn = document.createElement("button");
+      attBtn.type = "button";
+      attBtn.className = "btn btn-outline-secondary btn-sm icon-button bca-navatt";
+      attBtn.innerHTML = ATTENDANCE_SVG;
+      attBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleAttLinks();
+      });
+    }
+    if (!wantAtt && attBtn) { attBtn.remove(); attBtn = null; }
+    if (wantAtt && attBtn && attBtn.parentElement !== group) group.appendChild(attBtn);
+
     refreshCopyUi();
   }
+
+  /** attendance hub: a small dropdown under the icon —
+      1) হাজিরা কাউন্টার (/attendance)  2) নোটপ্যাড (/notepad) — both in a new tab */
+  let attLinksOutside = null;
+  let attLinksEscape = null;
+  function removeAttLinks() {
+    root().querySelectorAll(".bca-attlinks").forEach((p) => p.remove());
+    if (attLinksOutside) { document.removeEventListener("click", attLinksOutside, true); attLinksOutside = null; }
+    if (attLinksEscape) { document.removeEventListener("keydown", attLinksEscape, true); attLinksEscape = null; }
+  }
+  function toggleAttLinks() {
+    const existing = root().querySelector(".bca-attlinks");
+    closePopup();
+    if (existing) return; // icon toggles the dropdown
+    const pop = document.createElement("div");
+    pop.className = "bca-popup bca-attlinks";
+    pop.innerHTML =
+      '<a class="bca-attlinks-item" href="/attendance" target="_blank" rel="noopener"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 2a.5.5 0 0 0-.5.5v12a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-12a.5.5 0 0 0-.5-.5H12a.5.5 0 0 1 0-1h.5A1.5 1.5 0 0 1 14 2.5v12a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 14.5v-12A1.5 1.5 0 0 1 3.5 1H4a.5.5 0 0 1 0 1z"/><path d="M10 .5a.5.5 0 0 0-.5-.5h-3a.5.5 0 0 0-.5.5.5.5 0 0 1-.5.5.5.5 0 0 0-.5.5V2a.5.5 0 0 0 .5.5h5A.5.5 0 0 0 11 2v-.5a.5.5 0 0 0-.5-.5.5.5 0 0 1-.5-.5"/></svg><span>হাজিরা কাউন্টার</span></a>' +
+      '<a class="bca-attlinks-item" href="/notepad" target="_blank" rel="noopener"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 10.5a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 0 1h-2a.5.5 0 0 1-.5-.5m0-2a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5m0-2a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5m0-2a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5"/><path d="M3 0h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2v-1h1v1a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v1H1V2a2 2 0 0 1 2-2"/><path d="M1 5v-.5a.5.5 0 0 1 1 0V5h.5a.5.5 0 0 1 0 1h-2a.5.5 0 0 1 0-1zm0 3v-.5a.5.5 0 0 1 1 0V8h.5a.5.5 0 0 1 0 1h-2a.5.5 0 0 1 0-1zm0 3v-.5a.5.5 0 0 1 1 0v.5h.5a.5.5 0 0 1 0 1h-2a.5.5 0 0 1 0-1z"/></svg><span>নোটপ্যাড</span></a>';
+    root().appendChild(pop);
+    attLinksOutside = (e) => {
+      if (!pop.contains(e.target) && !e.target.closest(".bca-navatt")) removeAttLinks();
+    };
+    attLinksEscape = (e) => { if (e.key === "Escape") removeAttLinks(); };
+    document.addEventListener("click", attLinksOutside, true);
+    document.addEventListener("keydown", attLinksEscape, true);
+  }
+  const teardownHooks = [];
+  teardownHooks.push(removeAttLinks);
 
   /** when the admin hides the online-users list, regular users shouldn't even
       see the users tab / side panel — hide the React-rendered surfaces
@@ -1875,6 +1962,10 @@
 
   /** fallback when the navbar isn't available: floating button */
   function addFab() {
+    // chat page only: never on /login, /register, /admin (owner screenshot —
+    // the FAB floated over the bare login form; the navbar isn't there yet
+    // but the page is clearly not the chat)
+    if (!document.querySelector('div[id^="message-"]')) return;
     if (root().querySelector(".bca-fab")) return;
     const s = S();
     const fab = document.createElement("button");
@@ -1940,8 +2031,11 @@
     meUser = null;
     if (navBtn) { navBtn.remove(); navBtn = null; }
     if (adminBtn) { adminBtn.remove(); adminBtn = null; }
+    if (attBtn) { attBtn.remove(); attBtn = null; }
+    if (typeof removeAttLinks === "function") removeAttLinks();
     root().querySelectorAll(".bca-fab").forEach((x) => x.remove());
     closePopup();
+    for (const hook of teardownHooks) { try { hook(); } catch { /* noop */ } }
   }
 
   async function evaluateSession() {

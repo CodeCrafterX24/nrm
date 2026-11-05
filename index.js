@@ -45557,7 +45557,7 @@ var require_BaseGistRepository = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     var CryptoJS = require_crypto_js();
     var logger_1 = require_logger2();
-    var FLUSH_INTERVAL_MS = parseInt(process.env.GIST_FLUSH_INTERVAL_MS || "5000", 10);
+    var FLUSH_INTERVAL_MS = parseInt(process.env.GIST_FLUSH_INTERVAL_MS || "20000", 10);
     var LOAD_ATTEMPTS = parseInt(process.env.GIST_LOAD_ATTEMPTS || "8", 10);
     var GITHUB_API = "https://api.github.com";
     var log = (0, logger_1.default)(__filename);
@@ -46328,6 +46328,8 @@ var require_repositoryFactory = __commonJS({
     exports2.getUserRepository = getUserRepository;
     exports2.getMessageRepository = getMessageRepository;
     exports2.getSettingRepository = getSettingRepository;
+    exports2.applyMessageStoreMode = applyMessageStoreMode;
+    exports2.currentMessageStoreMode = currentMessageStoreMode;
     var logger_1 = __importDefault(require_logger2());
     var ClientError_1 = require_ClientError();
     var Storage_1 = require_storageTypes();
@@ -46384,6 +46386,7 @@ var require_repositoryFactory = __commonJS({
     var messageRepository;
     var settingRepository;
     var userRepository;
+    var messageStoreModeLive = "gist";
     function getUserRepository() {
       if (!userRepository) {
         userRepository = getRepository(Storage_1.StorageModels.User, defaultStorage);
@@ -46401,6 +46404,66 @@ var require_repositoryFactory = __commonJS({
         settingRepository = getRepository(Storage_1.StorageModels.Setting, defaultStorage);
       }
       return settingRepository;
+    }
+    function applyMessageStoreMode(mode) {
+      if (mode !== "memory" && mode !== "gist")
+        return;
+      if (mode === "memory") {
+        if (messageStoreModeLive === "memory" && messageRepository instanceof DiskStorageRepositoryImpl_1.DiskStorageRepositoryImpl)
+          return;
+        const old = messageRepository;
+        if (old && old.flushTimer) {
+          clearTimeout(old.flushTimer);
+          old.flushTimer = null;
+        }
+        const memRepo = getRepository(Storage_1.StorageModels.Message, Storage_1.StorageTypes.diskStorage);
+        if (old && Array.isArray(old.items)) {
+          memRepo.items = old.items;
+          memRepo.maxId = old.items.reduce((m, it) => Math.max(m, it.id || 0), 0);
+        }
+        messageRepository = memRepo;
+        messageStoreModeLive = "memory";
+        log.info("message store mode \u2192 memory (messages no longer written to gists)");
+        return;
+      }
+      if (messageStoreModeLive === "gist" && !(messageRepository instanceof DiskStorageRepositoryImpl_1.DiskStorageRepositoryImpl)) {
+        messageStoreModeLive = "gist";
+        return;
+      }
+      const mem = messageRepository;
+      let durableRepo = null;
+      try {
+        durableRepo = getRepository(Storage_1.StorageModels.Message, Storage_1.StorageTypes.githubGistStorage);
+      } catch (err) {
+        log.warn(`gist repo unavailable (${err?.message}) \u2014 falling back to disk storage for messages`);
+      }
+      if (!durableRepo) {
+        log.warn("gist repo unavailable (env/offline) \u2014 falling back to disk storage for messages");
+        durableRepo = getRepository(Storage_1.StorageModels.Message, Storage_1.StorageTypes.diskStorage);
+      }
+      if (!durableRepo) {
+        log.error("no durable message repo available \u2014 staying on current repo");
+        return;
+      }
+      if (mem && Array.isArray(mem.items) && mem.items.length) {
+        durableRepo.items = mem.items.slice();
+        durableRepo.maxId = durableRepo.items.reduce((m, it) => Math.max(m, it.id || 0), 0);
+        if (typeof durableRepo.rebuildShards === "function")
+          durableRepo.rebuildShards();
+        messageRepository = durableRepo;
+        messageStoreModeLive = "gist";
+        log.info(`message store mode \u2192 durable (flushing ${durableRepo.items.length} messages)`);
+        if (typeof durableRepo.flush === "function")
+          durableRepo.flush().catch(() => {
+          });
+      } else {
+        messageRepository = durableRepo;
+        messageStoreModeLive = "gist";
+        log.info("message store mode \u2192 durable");
+      }
+    }
+    function currentMessageStoreMode() {
+      return messageStoreModeLive;
     }
   }
 });
@@ -46488,7 +46551,7 @@ var require_userCrudService = __commonJS({
       newUser.username = newUser.username?.trim();
       newUser.password = newUser.password?.trim();
       const userExists = await getUserByUserName(newUser.username);
-      if (userExists && userExists.length === 1)
+      if (userExists && userExists.length > 0)
         throw ClientError_1.ClientError.duplicateError();
       newUser.password = newUser.getPasswordHash();
       const user = await (0, config_1.getUserRepository)().add(new User_1.User(newUser));
@@ -46676,21 +46739,26 @@ var require_authService = __commonJS({
         throw ClientError_1.ClientError.invalidCredentials();
       log.debug("login called");
       const result = await userCrudService.getUserByUserName(user.username);
-      if (!result || result.length != 1)
+      if (!result || result.length === 0)
         throw ClientError_1.ClientError.notExistsError();
-      if (!result[0].active) {
+      if (result.length > 1) {
+        result.sort((a, b) => (a.id || 0) - (b.id || 0));
+        log.warn(`login: ${result.length} records found for ${user.username} \u2014 using the newest (id ${result[result.length - 1].id})`);
+      }
+      const record = result[result.length - 1];
+      if (!record.active) {
         log.debug("login failed, User Inactive");
         throw ClientError_1.ClientError.inactiveUser();
       }
-      const compare = await comparePass(user.password, result[0].password);
+      const compare = await comparePass(user.password, record.password);
       if (!compare)
         throw ClientError_1.ClientError.WrongPassword();
       const userDto = new UserDto_1.UserDto(
-        result[0]
+        record
         // returns user model
       );
-      result[0].lastLoginDate = (/* @__PURE__ */ new Date()).toISOString();
-      await (0, config_1.getUserRepository)().update(result[0]);
+      record.lastLoginDate = (/* @__PURE__ */ new Date()).toISOString();
+      await (0, config_1.getUserRepository)().update(record);
       return userDto;
     };
     exports2.login = login;
@@ -59154,8 +59222,12 @@ var require_Setting = __commonJS({
     var SETTING_LIMITS = {
       /** UI-editable html for the attendance counter page (raw html, not sanitized) */
       attendanceHtml: 3e5,
+      /** shared note shown on the attendance page (plain text, not sanitized) */
+      attendanceNote: 1e5,
       /** UI-editable html/css/js for the fullscreen login notice (raw, not sanitized) */
       fsNotice: 1e5,
+      /** fullscreen-notice confirm button label (plain text, short) */
+      fsNoticeOkLabel: 60,
       /** one username entry */
       username: 50,
       /** members of a selected-users list */
@@ -59279,10 +59351,18 @@ var require_Setting = __commonJS({
       attendanceSelected;
       /** raw, admin-editiable html rendered by GET /attendance */
       attendanceHtml;
+      /** shared plain-text note shown on the attendance page (admin + selected users) */
+      attendanceNote;
       /** raw, admin-editable html/css/js shown fullscreen after every login */
       fsNotice;
       /** ISO timestamp of the last fullscreen-notice save ("" = never) */
       fsNoticeUpdatedAt;
+      /** custom text for the fullscreen-notice confirm button ("" = default) */
+      fsNoticeOkLabel;
+      /** where new chat messages persist: "gist" (durable, slower) | "memory"
+          (server-local, fast — lost on restart/redeploy). User+Setting always
+          persist in the gist regardless. */
+      messageStoreMode;
       constructor(json = {}) {
         super(json);
         this.notice = json.notice || "";
@@ -59301,8 +59381,11 @@ var require_Setting = __commonJS({
         this.attendanceViewMode = normalizeMode(json.attendanceViewMode, "admin") === "all" ? "admin" : normalizeMode(json.attendanceViewMode, "admin");
         this.attendanceSelected = normalizeUsernames(json.attendanceSelected);
         this.attendanceHtml = typeof json.attendanceHtml === "string" ? json.attendanceHtml.slice(0, SETTING_LIMITS.attendanceHtml) : "";
+        this.attendanceNote = typeof json.attendanceNote === "string" ? json.attendanceNote.slice(0, SETTING_LIMITS.attendanceNote) : "";
         this.fsNotice = typeof json.fsNotice === "string" ? json.fsNotice.slice(0, SETTING_LIMITS.fsNotice) : "";
         this.fsNoticeUpdatedAt = typeof json.fsNoticeUpdatedAt === "string" ? json.fsNoticeUpdatedAt : "";
+        this.fsNoticeOkLabel = typeof json.fsNoticeOkLabel === "string" ? json.fsNoticeOkLabel.slice(0, SETTING_LIMITS.fsNoticeOkLabel) : "";
+        this.messageStoreMode = json.messageStoreMode === "gist" ? "gist" : "memory";
       }
     };
     exports2.Setting = Setting;
@@ -59468,11 +59551,17 @@ var require_attendanceService = __commonJS({
       attendanceViewMode: setting?.attendanceViewMode === "selected" ? "selected" : "admin",
       attendanceSelected: Array.isArray(setting?.attendanceSelected) ? setting.attendanceSelected : [],
       attendanceHtml: typeof setting?.attendanceHtml === "string" ? setting.attendanceHtml : "",
+      attendanceNote: typeof setting?.attendanceNote === "string" ? setting.attendanceNote : "",
       // always sent: the editor's "restore starter page" button must work even
       // after the admin saved a custom document
       defaultHtml: Setting_1.ATTENDANCE_DEFAULT_HTML,
       limit: SETTING_LIMITS.attendanceHtml
     });
+    var validateAttendanceNote = (value) => {
+      if (typeof value !== "string") return "";
+      if (value.length > SETTING_LIMITS.attendanceNote) return null;
+      return value;
+    };
     var validateAttendanceHtml = (value) => {
       if (typeof value !== "string") return "";
       if (value.length > SETTING_LIMITS.attendanceHtml) return null;
@@ -59518,6 +59607,7 @@ var require_attendanceService = __commonJS({
     exports2.renderAttendancePage = renderAttendancePage;
     exports2.attendanceDeniedPage = attendanceDeniedPage;
     exports2.attendanceEmptyPage = attendanceEmptyPage;
+    exports2.validateAttendanceNote = validateAttendanceNote;
   }
 });
 
@@ -59616,6 +59706,37 @@ var require_settingController = __commonJS({
       }
     };
     exports2.saveAttendanceHtml = saveAttendanceHtml;
+    var getAttendanceNote = async (req, res) => {
+      try {
+        const setting = await getSetting();
+        const user = req.session?.userInfo;
+        if (!(0, permissions_1.canViewAttendance)(setting, user))
+          return res.sendStatus(403);
+        res.status(200).json({ note: typeof setting.attendanceNote === "string" ? setting.attendanceNote : "" });
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.getAttendanceNote = getAttendanceNote;
+    var saveAttendanceNote = async (req, res) => {
+      try {
+        const setting = await getSetting();
+        const user = req.session?.userInfo;
+        if (!(0, permissions_1.canViewAttendance)(setting, user))
+          return res.sendStatus(403);
+        const note = (0, attendanceService_1.validateAttendanceNote)(req.body?.note);
+        if (note === null)
+          return res.status(400).json({ errorMessage: "client_error.too_large_error" });
+        const repository = (0, config_1.getSettingRepository)();
+        setting.attendanceNote = note;
+        await repository.update(setting);
+        log.info(`attendance note saved (${note.length} chars)`);
+        res.status(200).json({ note });
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.saveAttendanceNote = saveAttendanceNote;
     var logger_1 = __importDefault(require_logger2());
     var ClientError_1 = require_ClientError();
     var ChatService_1 = require_chatService();
@@ -59625,6 +59746,7 @@ var require_settingController = __commonJS({
     var htmlSanitizer_1 = require_htmlSanitizer();
     var permissions_1 = require_permissions();
     var attendanceService_1 = require_attendanceService();
+    var repositoryFactoryRef = require_repositoryFactory();
     var log = (0, logger_1.default)(__filename);
     async function getSetting() {
       const settings = await (0, config_1.getSettingRepository)().get();
@@ -59697,7 +59819,12 @@ var require_settingController = __commonJS({
     var getFsNotice = async (req, res) => {
       try {
         const setting = await getSetting();
-        res.status(200).json({ notice: setting.fsNotice || "", updatedAt: setting.fsNoticeUpdatedAt || "" });
+        res.status(200).json({
+          notice: setting.fsNotice || "",
+          updatedAt: setting.fsNoticeUpdatedAt || "",
+          okLabel: setting.fsNoticeOkLabel || "",
+          messageStoreMode: setting.messageStoreMode || "memory"
+        });
       } catch (error) {
         handleError(error, res);
       }
@@ -59709,12 +59836,21 @@ var require_settingController = __commonJS({
       log.debug("updating fullscreen notice");
       try {
         const raw = typeof req.body?.notice === "string" ? req.body.notice : "";
+        const okLabel = typeof req.body?.okLabel === "string" ? req.body.okLabel.trim().slice(0, Setting_1.SETTING_LIMITS.fsNoticeOkLabel) : "";
         if (raw.length > Setting_1.SETTING_LIMITS.fsNotice)
           return res.status(400).json({ errorMessage: "client_error.too_large_error" });
         const repository = (0, config_1.getSettingRepository)();
         const setting = await getSetting();
         setting.fsNotice = raw;
+        setting.fsNoticeOkLabel = okLabel;
         setting.fsNoticeUpdatedAt = (/* @__PURE__ */ new Date()).toISOString();
+        if (req.body?.messageStoreMode === "memory" || req.body?.messageStoreMode === "gist") {
+          const mode = req.body.messageStoreMode;
+          const changed = setting.messageStoreMode !== mode;
+          setting.messageStoreMode = mode;
+          if (changed)
+            repositoryFactoryRef.applyMessageStoreMode(mode);
+        }
         await repository.update(setting);
         log.info(`fullscreen notice saved (${raw.length} chars)`);
         res.sendStatus(200);
@@ -59753,6 +59889,20 @@ var require_settingController = __commonJS({
       }
     };
     exports2.disableChat = disableChat;
+    var getMessageStoreMode = async (req, res) => {
+      if (!req.session?.userInfo?.isAdmin)
+        return res.sendStatus(403);
+      try {
+        const setting = await getSetting();
+        res.status(200).json({
+          messageStoreMode: setting.messageStoreMode === "gist" ? "gist" : "memory",
+          live: repositoryFactoryRef.currentMessageStoreMode()
+        });
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.getMessageStoreMode = getMessageStoreMode;
     var canWeChat = async (req, res) => {
       try {
         const setting = await getSetting();
@@ -59847,6 +59997,459 @@ var require_settingController = __commonJS({
   }
 });
 
+// server/src/socket/socketEvents.js
+var require_socketEvents = __commonJS({
+  "server/src/socket/socketEvents.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.socketEvents = void 0;
+    exports2.socketEvents = {
+      usersWithStatus: "usersWithStatus",
+      disconnect: "disconnect",
+      deleteChat: "deleteChat",
+      chatDeleted: "chatDeleted",
+      updateNotice: "updateNotice",
+      updateFsNotice: "updateFsNotice",
+      chatMessage: "chatMessage",
+      editMessage: "editMessage",
+      editedMessage: "editedMessage",
+      reactMessage: "reactMessage",
+      reactedMessage: "reactedMessage",
+      deleteMessage: "deleteMessage",
+      deletedMessage: "deletedMessage",
+      changeStatus: "changeStatus",
+      changedStatus: "changedStatus",
+      triggerTyping: "triggerTyping",
+      typingMessage: "typingMessage"
+    };
+  }
+});
+
+// server/src/socket/chatHandler.js
+var require_chatHandler = __commonJS({
+  "server/src/socket/chatHandler.js"(exports2) {
+    "use strict";
+    var __importDefault = exports2 && exports2.__importDefault || function(mod) {
+      return mod && mod.__esModule ? mod : { "default": mod };
+    };
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.handleChatMessage = handleChatMessage;
+    exports2.handleEditMessage = handleEditMessage;
+    exports2.handleReactMessage = handleReactMessage;
+    exports2.handleDeleteMessage = handleDeleteMessage;
+    exports2.handleDeleteChat = handleDeleteChat;
+    exports2.handleUpdateNotice = handleUpdateNotice;
+    exports2.handleUpdateFsNotice = handleUpdateFsNotice;
+    var config_1 = require_repositoryFactory();
+    var logger_1 = __importDefault(require_logger2());
+    var ClientError_1 = require_ClientError();
+    var SocketEvents_1 = require_socketEvents();
+    var User_1 = require_User();
+    var htmlSanitizer_1 = require_htmlSanitizer();
+    var log = (0, logger_1.default)(__filename);
+    function safeCallback(callback, payload) {
+      if (typeof callback === "function")
+        callback(payload);
+    }
+    async function handleChatMessage(message, callback, socket) {
+      log.debug(`Received chat message: ${JSON.stringify(message)}`);
+      try {
+        if (!message?.text?.trim()) {
+          safeCallback(callback, ClientError_1.ClientError.invalidError());
+          return;
+        }
+        if (message.text.length > htmlSanitizer_1.MAX_MESSAGE_CHARS) {
+          safeCallback(callback, ClientError_1.ClientError.tooLargeError());
+          return;
+        }
+        const repository = (0, config_1.getMessageRepository)();
+        message.username = socket.request.session.userInfo.username;
+        message.role = socket.request.session.userInfo.isAdmin ? User_1.RoleEnum.ADMIN : User_1.RoleEnum.NON_ADMIN;
+        message.text = (0, htmlSanitizer_1.sanitizeMessageHtml)(message.text);
+        if (!message.text.trim()) {
+          safeCallback(callback, ClientError_1.ClientError.invalidError());
+          return;
+        }
+        message.time = (/* @__PURE__ */ new Date()).toISOString();
+        const result = await repository.add(message);
+        safeCallback(callback, result);
+        socket.broadcast.emit(SocketEvents_1.socketEvents.chatMessage, message);
+      } catch (err) {
+        log.error(err);
+        safeCallback(callback, ClientError_1.ClientError.internalError());
+      }
+    }
+    async function handleEditMessage(updateMessage, socket, callback) {
+      log.debug(`Received edit message: ${JSON.stringify(updateMessage)}`);
+      try {
+        if (!updateMessage?.id || !updateMessage?.text?.trim()) {
+          safeCallback(callback, ClientError_1.ClientError.invalidError());
+          return;
+        }
+        if (updateMessage.text.length > htmlSanitizer_1.MAX_MESSAGE_CHARS) {
+          safeCallback(callback, ClientError_1.ClientError.tooLargeError());
+          return;
+        }
+        const repository = (0, config_1.getMessageRepository)();
+        const message = await repository.find(updateMessage.id);
+        if (!message) {
+          safeCallback(callback, ClientError_1.ClientError.notExistsError());
+          return;
+        }
+        const loggedInUser = socket.request.session.userInfo;
+        if (message.username != loggedInUser.username) {
+          safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
+          return;
+        }
+        message.text = (0, htmlSanitizer_1.sanitizeMessageHtml)(updateMessage.text);
+        if (!message.text.trim()) {
+          safeCallback(callback, ClientError_1.ClientError.invalidError());
+          return;
+        }
+        message.edited_at = (/* @__PURE__ */ new Date()).toISOString();
+        const updatedMessage = await repository.update(message);
+        safeCallback(callback, updatedMessage);
+        socket.broadcast.emit(SocketEvents_1.socketEvents.editedMessage, updatedMessage);
+      } catch (err) {
+        log.error(err);
+        safeCallback(callback, ClientError_1.ClientError.internalError());
+      }
+    }
+    async function handleReactMessage(reactedMessage, socket, callback) {
+      log.debug(`Received reaction to message: ${JSON.stringify(reactedMessage)}`);
+      try {
+        if (!reactedMessage?.id)
+          throw ClientError_1.ClientError.invalidError();
+        const repository = (0, config_1.getMessageRepository)();
+        const message = await repository.find(reactedMessage.id);
+        if (!message)
+          throw ClientError_1.ClientError.invalidError();
+        const curUserName = socket.request.session.userInfo.username;
+        if (!message.reactions || typeof message.reactions !== "object")
+          message.reactions = {};
+        for (const emoji of Object.keys(reactedMessage.reactions || {})) {
+          const incoming = reactedMessage.reactions[emoji];
+          if (!incoming || !Array.isArray(incoming.usernames))
+            continue;
+          if (!message.reactions[emoji] || !Array.isArray(message.reactions[emoji].usernames))
+            message.reactions[emoji] = { usernames: [] };
+          const userList = message.reactions[emoji].usernames;
+          const foundUsr = incoming.usernames.find((usrname) => usrname == curUserName);
+          const curUsr = userList.find((usrname) => usrname == curUserName);
+          if (foundUsr && !curUsr)
+            userList.push(curUserName);
+          else if (!foundUsr && curUsr)
+            message.reactions[emoji].usernames = userList.filter((usr) => usr != curUserName);
+        }
+        reactedMessage.reactions = message.reactions;
+        await repository.update(message);
+        safeCallback(callback, reactedMessage);
+        socket.broadcast.emit(SocketEvents_1.socketEvents.reactedMessage, reactedMessage);
+      } catch (err) {
+        log.error(err);
+        safeCallback(callback, ClientError_1.ClientError.internalError());
+      }
+    }
+    async function handleDeleteChat(socket, callback) {
+      log.debug(`Received delete chat request.`);
+      try {
+        if (!socket.request.session.userInfo.isAdmin) {
+          safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
+          return;
+        }
+        const repository = (0, config_1.getMessageRepository)();
+        await repository.removeAll();
+        safeCallback(callback, "ok");
+        socket.broadcast.emit(SocketEvents_1.socketEvents.chatDeleted);
+      } catch (err) {
+        log.error(err);
+        safeCallback(callback, ClientError_1.ClientError.internalError());
+      }
+    }
+    async function handleDeleteMessage(id, socket, callback) {
+      try {
+        if (!id) {
+          safeCallback(callback, ClientError_1.ClientError.invalidError());
+          return;
+        }
+        const loggedInUser = socket.request.session.userInfo;
+        const repository = (0, config_1.getMessageRepository)();
+        const message = await repository.find(id);
+        if (!message) {
+          safeCallback(callback, { status: false });
+          return;
+        }
+        if (message.username != loggedInUser.username && !loggedInUser.isAdmin) {
+          safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
+          return;
+        }
+        const result = await repository.remove(id);
+        if (result) {
+          log.debug(`Deleted message with id: ${id}`);
+          socket.broadcast.emit(SocketEvents_1.socketEvents.deletedMessage, id);
+          safeCallback(callback, { status: true });
+        } else {
+          log.debug(`Failed to delete msg ${id}, as the id doesn't exist`);
+          safeCallback(callback, { status: false });
+        }
+      } catch (err) {
+        log.error(err);
+        safeCallback(callback, { status: false, error: ClientError_1.ClientError.internalError() });
+      }
+    }
+    async function handleUpdateNotice(socket, callback) {
+      try {
+        if (!socket.request.session.userInfo?.isAdmin) {
+          safeCallback(callback, JSON.stringify({ success: false, error: "client_error.access_denied" }));
+          return;
+        }
+        socket.broadcast.emit(SocketEvents_1.socketEvents.updateNotice);
+        safeCallback(callback, JSON.stringify({ success: true }));
+      } catch (err) {
+        log.error(err);
+        safeCallback(callback, JSON.stringify({ success: false }));
+      }
+    }
+    async function handleUpdateFsNotice(socket, callback) {
+      try {
+        if (!socket.request.session.userInfo?.isAdmin) {
+          safeCallback(callback, JSON.stringify({ success: false, error: "client_error.access_denied" }));
+          return;
+        }
+        socket.broadcast.emit(SocketEvents_1.socketEvents.updateFsNotice);
+        safeCallback(callback, JSON.stringify({ success: true }));
+      } catch (err) {
+        log.error(err);
+        safeCallback(callback, JSON.stringify({ success: false }));
+      }
+    }
+  }
+});
+
+// server/src/socket/userHandler.js
+var require_userHandler = __commonJS({
+  "server/src/socket/userHandler.js"(exports2) {
+    "use strict";
+    var __importDefault = exports2 && exports2.__importDefault || function(mod) {
+      return mod && mod.__esModule ? mod : { "default": mod };
+    };
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.broadcastUsersList = broadcastUsersList;
+    exports2.handleChangeStatus = handleChangeStatus;
+    exports2.handleTriggerTyping = handleTriggerTyping;
+    var logger_1 = __importDefault(require_logger2());
+    var UserDto_1 = require_UserDto();
+    var ClientError_1 = require_ClientError();
+    var UserCrudService_1 = require_userCrudService();
+    var config_1 = require_repositoryFactory();
+    var SocketEvents_1 = require_socketEvents();
+    var permissions_1 = require_permissions();
+    var log = (0, logger_1.default)(__filename);
+    var cachedUsers = [];
+    async function broadcastUsersList(io) {
+      try {
+        let dbUsers = await (0, UserCrudService_1.getUsers)();
+        dbUsers = dbUsers.filter((user) => user.active);
+        const activeUsers = getActiveUsers(io);
+        let updatedUsers = dbUsers.map((user) => updateUserStatus(user, activeUsers));
+        updatedUsers = updatedUsers.filter((user) => user.status === UserDto_1.userStatuses.online);
+        let setting = null;
+        try {
+          const settings = await (0, config_1.getSettingRepository)().get();
+          setting = settings[0] || null;
+        } catch (settingErr) {
+          log.error(settingErr);
+        }
+        const failOpen = setting === null;
+        for (const socket of io.sockets.sockets.values()) {
+          const session = socket.request?.session?.userInfo;
+          const maySeeAll = failOpen || (0, permissions_1.canSeeOnlineUsers)(setting, session);
+          const payload = maySeeAll ? updatedUsers : updatedUsers.filter((u) => u.username === session?.username);
+          socket.emit(SocketEvents_1.socketEvents.usersWithStatus, payload);
+        }
+      } catch (err) {
+        log.error(err);
+      }
+    }
+    function getActiveUsers(io) {
+      return Array.from(io.sockets.sockets.values()).map(({ id, handshake, request }) => {
+        const { time } = handshake;
+        const username = request.session.userInfo.username;
+        return { socketId: id, username, connectedAt: time };
+      });
+    }
+    function updateUserStatus(user, activeUsers) {
+      const activeUser = activeUsers.find((activeUser2) => activeUser2.username === user.username);
+      const time = activeUser ? new Date(activeUser.connectedAt).toISOString() : user.lastLoginDate || user.createdDate;
+      const socketId = activeUser ? activeUser.socketId : void 0;
+      const cachedUserIndex = cachedUsers.findIndex((cachedUser) => cachedUser.username === user.username);
+      const status = activeUser ? UserDto_1.userStatuses.online : UserDto_1.userStatuses.offline;
+      const updatedUser = {
+        username: user.username,
+        status,
+        time,
+        socketId,
+        active: user.active,
+        typing: false
+      };
+      if (cachedUserIndex === -1) {
+        cachedUsers.push(updatedUser);
+      } else {
+        cachedUsers[cachedUserIndex] = updatedUser;
+      }
+      return updatedUser;
+    }
+    async function handleChangeStatus(user, socket, callback) {
+      log.debug(`Received update status to user: ${JSON.stringify(user)}`);
+      try {
+        const username = socket.request.session.userInfo?.username;
+        const cuIndex = cachedUsers.findIndex((u) => u.username == username);
+        const cUser = cachedUsers[cuIndex];
+        if (cUser) {
+          cachedUsers[cuIndex].status = user?.status;
+          cachedUsers[cuIndex].username = username;
+          if (typeof callback === "function") {
+            callback(cUser);
+          }
+          socket.broadcast.emit(SocketEvents_1.socketEvents.changedStatus, cUser);
+        } else {
+          if (typeof callback === "function") {
+            callback({ ...user, username });
+          }
+        }
+      } catch (err) {
+        log.error(err);
+        if (typeof callback === "function")
+          callback(ClientError_1.ClientError.internalError());
+      }
+    }
+    var lastTypingBroadcast = /* @__PURE__ */ new Map();
+    var TYPING_MIN_INTERVAL_MS = 1200;
+    async function handleTriggerTyping(user, socket, callback) {
+      try {
+        const username = socket.request.session.userInfo?.username;
+        const typing = user?.typing !== false;
+        const now = Date.now();
+        const last = lastTypingBroadcast.get(username) || 0;
+        if (typing && now - last < TYPING_MIN_INTERVAL_MS) {
+          if (typeof callback === "function")
+            callback(JSON.stringify({ ...user, username, typing: true }));
+          return;
+        }
+        lastTypingBroadcast.set(username, now);
+        const payload = { ...user || {}, username, typing };
+        log.debug(`Broadcasting typing status: ${JSON.stringify(payload)}`);
+        if (typeof callback === "function") {
+          callback(JSON.stringify(payload));
+        }
+        socket.broadcast.emit(SocketEvents_1.socketEvents.typingMessage, payload);
+      } catch (err) {
+        log.error(err);
+        if (typeof callback === "function")
+          callback(JSON.stringify({ error: true }));
+      }
+    }
+  }
+});
+
+// server/src/models/Message.js
+var require_Message = __commonJS({
+  "server/src/models/Message.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.Message = void 0;
+    var BaseModel_1 = require_BaseModel();
+    var User_1 = require_User();
+    var ReplyTo = class {
+      id;
+      username;
+      text;
+      constructor(json) {
+        this.id = json.id;
+        this.text = typeof json.text === "string" ? json.text.substr(0, 50) : "";
+        this.username = json.username;
+      }
+    };
+    var Message = class extends BaseModel_1.BaseModel {
+      text;
+      username;
+      time;
+      replyTo;
+      edited_at;
+      role = User_1.RoleEnum.NON_ADMIN;
+      reactions;
+      constructor(json = {}) {
+        super(json);
+        this.text = json.text || "";
+        this.username = json.username || "";
+        this.time = json.time || "";
+        this.replyTo = json.replyTo ? new ReplyTo(json.replyTo) : null;
+        this.reactions = json.reactions || {};
+      }
+    };
+    exports2.Message = Message;
+  }
+});
+
+// server/src/socket/socketService.js
+var require_socketService = __commonJS({
+  "server/src/socket/socketService.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    var chatHandler_1 = require_chatHandler();
+    var userHandler_1 = require_userHandler();
+    var Message_1 = require_Message();
+    var SocketEvents_1 = require_socketEvents();
+    function socketService(io) {
+      setLiveIo(io);
+      const onConnection = (socket) => {
+        const sessionId = socket.request.session.id;
+        socket.join(sessionId);
+        socket.on(SocketEvents_1.socketEvents.disconnect, () => {
+          (0, userHandler_1.broadcastUsersList)(io);
+        });
+        (0, userHandler_1.broadcastUsersList)(io);
+        socket.on(SocketEvents_1.socketEvents.editMessage, (message, callback) => {
+          (0, chatHandler_1.handleEditMessage)(message, socket, callback);
+        });
+        socket.on(SocketEvents_1.socketEvents.reactMessage, (message, callback) => {
+          (0, chatHandler_1.handleReactMessage)(message, socket, callback);
+        });
+        socket.on(SocketEvents_1.socketEvents.deleteMessage, (id, callback) => {
+          (0, chatHandler_1.handleDeleteMessage)(id, socket, callback);
+        });
+        socket.on(SocketEvents_1.socketEvents.deleteChat, (callback) => {
+          (0, chatHandler_1.handleDeleteChat)(socket, callback);
+        });
+        socket.on(SocketEvents_1.socketEvents.chatMessage, (message, callback) => {
+          (0, chatHandler_1.handleChatMessage)(new Message_1.Message(message), callback, socket);
+        });
+        socket.on(SocketEvents_1.socketEvents.updateNotice, (callback) => {
+          (0, chatHandler_1.handleUpdateNotice)(socket, callback);
+        });
+        socket.on(SocketEvents_1.socketEvents.updateFsNotice, (callback) => {
+          (0, chatHandler_1.handleUpdateFsNotice)(socket, callback);
+        });
+        socket.on(SocketEvents_1.socketEvents.changeStatus, (user, callback) => {
+          (0, userHandler_1.handleChangeStatus)(user, socket, callback);
+        });
+        socket.on(SocketEvents_1.socketEvents.triggerTyping, (user, callback) => {
+          (0, userHandler_1.handleTriggerTyping)(user, socket, callback);
+        });
+      };
+      io.on("connection", onConnection);
+    }
+    exports2["default"] = socketService;
+    var liveIo = null;
+    var setLiveIo = (io) => {
+      liveIo = io;
+    };
+    var getLiveIo = () => liveIo;
+    exports2.setLiveIo = setLiveIo;
+    exports2.getLiveIo = getLiveIo;
+  }
+});
+
 // server/src/controllers/chatController.js
 var require_chatController = __commonJS({
   "server/src/controllers/chatController.js"(exports2) {
@@ -59855,7 +60458,10 @@ var require_chatController = __commonJS({
       return mod && mod.__esModule ? mod : { "default": mod };
     };
     Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.exportChat = exports2.getMissingMessages = exports2.getMessages = void 0;
+    exports2.exportChat = exports2.reactMessage = exports2.getMissingMessages = exports2.getMessages = void 0;
+    var socketService_1 = require_socketService();
+    var SocketEvents_1 = require_socketEvents();
+    var socketEvents_1 = require_socketEvents();
     var logger_1 = __importDefault(require_logger2());
     var ClientError_1 = require_ClientError();
     var config_1 = require_repositoryFactory();
@@ -59948,6 +60554,45 @@ var require_chatController = __commonJS({
       }
     };
     exports2.exportChat = exportChat;
+    var reactMessage = async (req, res) => {
+      try {
+        const reactedMessage = req.body || {};
+        if (!reactedMessage?.id)
+          throw ClientError_1.ClientError.invalidError();
+        const repository = (0, config_1.getMessageRepository)();
+        const message = await repository.find(reactedMessage.id);
+        if (!message)
+          throw new Error("message not found");
+        const curUserName = req.session?.userInfo?.username;
+        if (!curUserName)
+          throw ClientError_1.ClientError.accessDeniedError();
+        if (!message.reactions || typeof message.reactions !== "object")
+          message.reactions = {};
+        for (const emoji of Object.keys(reactedMessage.reactions || {})) {
+          const incoming = reactedMessage.reactions[emoji];
+          if (!incoming || !Array.isArray(incoming.usernames))
+            continue;
+          if (!message.reactions[emoji] || !Array.isArray(message.reactions[emoji].usernames))
+            message.reactions[emoji] = { usernames: [] };
+          const userList = message.reactions[emoji].usernames;
+          const foundUsr = incoming.usernames.find((usrname) => usrname == curUserName);
+          const curUsr = userList.find((usrname) => usrname == curUserName);
+          if (foundUsr && !curUsr)
+            userList.push(curUserName);
+          else if (!foundUsr && curUsr)
+            message.reactions[emoji].usernames = userList.filter((usr) => usr != curUserName);
+        }
+        reactedMessage.reactions = message.reactions;
+        await repository.update(message);
+        res.status(200).json(reactedMessage);
+        const io = (0, socketService_1.getLiveIo)();
+        if (io)
+          io.emit(SocketEvents_1.socketEvents.reactedMessage, reactedMessage);
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.reactMessage = reactMessage;
     var handleError = (error, res) => {
       if (error instanceof ClientError_1.ClientError) {
         res.status(400).send({ errorMessage: error.message });
@@ -60014,6 +60659,7 @@ var require_apiRouter = __commonJS({
     router.put("/chat/saveFrequentSymbols", SettingController_1.saveFrequentSymbols);
     router.post("/chat/getMessages", ChatController_1.getMessages);
     router.post("/chat/getMissingMessages", ChatController_1.getMissingMessages);
+    router.post("/chat/react", ChatController_1.reactMessage);
     router.put("/chat/updateNotice", SettingController_1.updateNotice);
     router.get("/chat/getFsNotice", SettingController_1.getFsNotice);
     router.put("/chat/updateFsNotice", SettingController_1.updateFsNotice);
@@ -60024,7 +60670,10 @@ var require_apiRouter = __commonJS({
     router.put("/chat/admin-settings", SettingController_1.saveAdminSettings);
     router.get("/chat/admin-settings", SettingController_1.getAdminSettings);
     router.get("/chat/attendance", SettingController_1.getAttendanceSettings);
+    router.get("/chat/messageStoreMode", SettingController_1.getMessageStoreMode);
     router.put("/chat/attendance", SettingController_1.saveAttendanceHtml);
+    router.get("/chat/attendance-note", SettingController_1.getAttendanceNote);
+    router.put("/chat/attendance-note", SettingController_1.saveAttendanceNote);
     router.put("/chat/enable", SettingController_1.enableChat);
     router.put("/chat/disable", SettingController_1.disableChat);
     router.get("/chat/canChat", SettingController_1.canWeChat);
@@ -61612,6 +62261,128 @@ var require_memorystore2 = __commonJS({
   }
 });
 
+// server/src/services/linksService.js
+var require_linksService = __commonJS({
+  "server/src/services/linksService.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.validateNotePut = exports2.notepadPage = exports2.linksPage = exports2.SETTINGS_HEADERS = void 0;
+    var SETTING_LIMITS_REF = require_Setting();
+    var SETTINGS_HEADERS = {
+      "Content-Type": "text/html; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Control": "no-store, max-age=0",
+      "X-Frame-Options": "SAMEORIGIN"
+    };
+    exports2.SETTINGS_HEADERS = SETTINGS_HEADERS;
+    var validateNotePut = (value) => {
+      if (typeof value !== "string") return "";
+      if (value.length > SETTING_LIMITS_REF.SETTING_LIMITS.attendanceNote) return null;
+      return value;
+    };
+    exports2.validateNotePut = validateNotePut;
+    var linksPage = () => ({
+      status: 200,
+      headers: SETTINGS_HEADERS,
+      body: `<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>\u09AA\u09C7\u099C-\u09A4\u09BE\u09B2\u09BF\u0995\u09BE</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 32px 16px; font-family: "Noto Sans Bengali", "Hind Siliguri", system-ui, sans-serif;
+         background: #f6f7f9; color: #1b1f24; }
+  h1 { font-size: 20px; margin: 0 0 18px; }
+  a.item { display: flex; align-items: center; gap: 10px; padding: 16px 18px; margin-bottom: 12px;
+           background: #fff; border: 1px solid #e3e8ee; border-radius: 12px; text-decoration: none;
+           color: inherit; font-size: 16px; font-weight: 600; }
+  a.item:hover { border-color: #2563eb; }
+  a.item .ic { font-size: 20px; }
+  a.item .sub { display: block; font-size: 12.5px; font-weight: 400; color: #5b6572; margin-top: 2px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #12161b; color: #e8edf3; }
+    a.item { background: #1b2128; border-color: #2b333d; }
+  }
+</style>
+</head>
+<body>
+  <h1>\u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u0993 \u09A8\u09CB\u099F</h1>
+  <a class="item" href="/attendance" target="_blank" rel="noopener"><span class="ic">\u{1F4CB}</span><span>\u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u0995\u09BE\u0989\u09A8\u09CD\u099F\u09BE\u09B0<span class="sub">\u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u09A6\u09C7\u0993\u09AF\u09BC\u09BE\u09B0 \u09AA\u09C7\u099C</span></span></a>
+  <a class="item" href="/notepad" target="_blank" rel="noopener"><span class="ic">\u{1F4DD}</span><span>\u09A8\u09CB\u099F\u09AA\u09CD\u09AF\u09BE\u09A1<span class="sub">\u09B6\u09C7\u09AF\u09BC\u09BE\u09B0\u09CD\u09A1 \u09A8\u09CB\u099F \u2014 \u09B2\u09BF\u0996\u09C1\u09A8 \u0993 \u09B8\u09C7\u09AD \u0995\u09B0\u09C1\u09A8</span></span></a>
+</body>
+</html>`
+    });
+    exports2.linksPage = linksPage;
+    var notepadPage = (initialNote) => ({
+      status: 200,
+      headers: SETTINGS_HEADERS,
+      body: `<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>\u09A8\u09CB\u099F\u09AA\u09CD\u09AF\u09BE\u09A1</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 24px 16px; font-family: "Noto Sans Bengali", "Hind Siliguri", system-ui, sans-serif;
+         background: #f6f7f9; color: #1b1f24; }
+  h1 { font-size: 20px; margin: 0 0 14px; }
+  textarea { width: 100%; min-height: 55vh; font: 15px/1.6 inherit; padding: 14px;
+             border-radius: 10px; border: 1px solid #c9d1da; background: #fff; color: inherit;
+             box-sizing: border-box; resize: vertical; }
+  .bar { display: flex; gap: 12px; align-items: center; margin-top: 12px; }
+  button { font: inherit; padding: 10px 18px; border-radius: 8px; border: 1px solid #2563eb;
+           background: #2563eb; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  #msg { font-size: 13px; color: #5b6572; }
+  a.back { color: #2563eb; text-decoration: none; font-size: 14px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #12161b; color: #e8edf3; }
+    textarea { background: #1b2128; border-color: #2b333d; }
+  }
+</style>
+</head>
+<body>
+  <h1>\u09A8\u09CB\u099F\u09AA\u09CD\u09AF\u09BE\u09A1</h1>
+  <textarea id="note" spellcheck="false"></textarea>
+  <div class="bar">
+    <button id="save">\u09B8\u09C7\u09AD \u0995\u09B0\u09C1\u09A8</button>
+    <span id="msg"></span>
+    <span style="flex:1"></span>
+    <a class="back" href="/links">\u2190 \u09A4\u09BE\u09B2\u09BF\u0995\u09BE\u09AF\u09BC \u09AB\u09BF\u09B0\u09C1\u09A8</a>
+  </div>
+<script>
+    (function () {
+      var box = document.getElementById("note");
+      var msg = document.getElementById("msg");
+      var save = document.getElementById("save");
+      box.value = ${JSON.stringify(typeof initialNote === "string" ? initialNote.slice(0, SETTING_LIMITS_REF.SETTING_LIMITS.attendanceNote) : "")};
+      save.onclick = function () {
+        save.disabled = true;
+        msg.textContent = "\u09B8\u09C7\u09AD \u09B9\u099A\u09CD\u099B\u09C7\u2026";
+        fetch("/api/chat/attendance-note", {
+          method: "PUT",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ note: box.value })
+        }).then(function (r) {
+          if (r.ok) { msg.textContent = "\u09B8\u09C7\u09AD \u09B9\u09AF\u09BC\u09C7\u099B\u09C7"; setTimeout(function () { msg.textContent = ""; }, 2000); }
+          else { msg.textContent = "\u09B8\u09C7\u09AD \u09B9\u09AF\u09BC\u09A8\u09BF \u2014 \u0986\u09AC\u09BE\u09B0 \u099A\u09C7\u09B7\u09CD\u099F\u09BE \u0995\u09B0\u09C1\u09A8"; }
+        }).catch(function () { msg.textContent = "\u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0\u09C7 \u09AA\u09CC\u0981\u099B\u09BE\u09A8\u09CB \u09AF\u09BE\u099A\u09CD\u099B\u09C7 \u09A8\u09BE"; })
+        .finally ? null : null;
+        save.disabled = false;
+      };
+    })();
+  </script>
+</body>
+</html>`
+    });
+    exports2.notepadPage = notepadPage;
+  }
+});
+
 // server/src/bootstrap/initData.js
 var require_initData = __commonJS({
   "server/src/bootstrap/initData.js"(exports2) {
@@ -61671,6 +62442,13 @@ var require_initData = __commonJS({
     async function initializeSettingAndUser() {
       await initializeSetting();
       await insertDummyAdminUser();
+      try {
+        const settings = await config_1.getSettingRepository().get();
+        const mode = settings[0]?.messageStoreMode === "gist" ? "gist" : "memory";
+        config_1.applyMessageStoreMode(mode);
+      } catch (err) {
+        log.error("applying saved message-store mode failed:", err);
+      }
     }
     initializeSettingAndUser();
   }
@@ -61725,6 +62503,7 @@ var require_app = __commonJS({
     var config_1 = require_repositoryFactory();
     var permissions_1 = require_permissions();
     var attendanceService_1 = require_attendanceService();
+    var linksService_1 = require_linksService();
     var logger_1 = __importDefault(require_logger2());
     var log = (0, logger_1.default)(__filename);
     require_initData();
@@ -61797,6 +62576,52 @@ var require_app = __commonJS({
       res.status(page.status).set(page.headers).send(page.body);
     };
     app.get(["/attendance", "/attendance/"], attendanceCounter);
+    var linksPageHandler = async (req, res) => {
+      const user = req.session?.userInfo;
+      if (!user?.username) {
+        const page2 = (0, attendanceService_1.attendanceEmptyPage)("/login");
+        return res.status(page2.status).set(page2.headers).send(page2.body);
+      }
+      let setting = null;
+      try {
+        const settings = await (0, config_1.getSettingRepository)().get();
+        setting = settings[0] || null;
+      } catch (error) {
+        log.error(error);
+        return res.status(503).set("Content-Type", "text/plain; charset=utf-8").send("storage unavailable");
+      }
+      if (!setting || !(0, permissions_1.canViewAttendance)(setting, user)) {
+        const page2 = (0, attendanceService_1.attendanceDeniedPage)();
+        return res.status(page2.status).set(page2.headers).send(page2.body);
+      }
+      const page = linksService_1.linksPage();
+      res.status(page.status).set(page.headers).send(page.body);
+    };
+    exports2.__bcaLinksPageHandler = linksPageHandler;
+    var notepadHandler = async (req, res) => {
+      const user = req.session?.userInfo;
+      if (!user?.username) {
+        const page2 = (0, attendanceService_1.attendanceEmptyPage)("/login");
+        return res.status(page2.status).set(page2.headers).send(page2.body);
+      }
+      let setting = null;
+      try {
+        const settings = await (0, config_1.getSettingRepository)().get();
+        setting = settings[0] || null;
+      } catch (error) {
+        log.error(error);
+        return res.status(503).set("Content-Type", "text/plain; charset=utf-8").send("storage unavailable");
+      }
+      if (!setting || !(0, permissions_1.canViewAttendance)(setting, user)) {
+        const page2 = (0, attendanceService_1.attendanceDeniedPage)();
+        return res.status(page2.status).set(page2.headers).send(page2.body);
+      }
+      const page = linksService_1.notepadPage(setting.attendanceNote);
+      res.status(page.status).set(page.headers).send(page.body);
+    };
+    exports2.__bcaNotepadHandler = notepadHandler;
+    app.get(["/links", "/links/"], linksPageHandler);
+    app.get(["/notepad", "/notepad/"], notepadHandler);
     app.use("/auth", auth_1.default);
     app.use("/api", router_1.default);
     app.use(["/api", "/auth"], (req, res) => {
@@ -61805,451 +62630,6 @@ var require_app = __commonJS({
     app.get("*", (req, res) => {
       res.sendFile(path_1.default.join(paths_1.PROJECT_ROOT, "public", "index.html"));
     });
-  }
-});
-
-// server/src/socket/socketEvents.js
-var require_socketEvents = __commonJS({
-  "server/src/socket/socketEvents.js"(exports2) {
-    "use strict";
-    Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.socketEvents = void 0;
-    exports2.socketEvents = {
-      usersWithStatus: "usersWithStatus",
-      disconnect: "disconnect",
-      deleteChat: "deleteChat",
-      chatDeleted: "chatDeleted",
-      updateNotice: "updateNotice",
-      updateFsNotice: "updateFsNotice",
-      chatMessage: "chatMessage",
-      editMessage: "editMessage",
-      editedMessage: "editedMessage",
-      reactMessage: "reactMessage",
-      reactedMessage: "reactedMessage",
-      deleteMessage: "deleteMessage",
-      deletedMessage: "deletedMessage",
-      changeStatus: "changeStatus",
-      changedStatus: "changedStatus",
-      triggerTyping: "triggerTyping",
-      typingMessage: "typingMessage"
-    };
-  }
-});
-
-// server/src/socket/chatHandler.js
-var require_chatHandler = __commonJS({
-  "server/src/socket/chatHandler.js"(exports2) {
-    "use strict";
-    var __importDefault = exports2 && exports2.__importDefault || function(mod) {
-      return mod && mod.__esModule ? mod : { "default": mod };
-    };
-    Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.handleChatMessage = handleChatMessage;
-    exports2.handleEditMessage = handleEditMessage;
-    exports2.handleReactMessage = handleReactMessage;
-    exports2.handleDeleteMessage = handleDeleteMessage;
-    exports2.handleDeleteChat = handleDeleteChat;
-    exports2.handleUpdateNotice = handleUpdateNotice;
-    exports2.handleUpdateFsNotice = handleUpdateFsNotice;
-    var config_1 = require_repositoryFactory();
-    var logger_1 = __importDefault(require_logger2());
-    var ClientError_1 = require_ClientError();
-    var SocketEvents_1 = require_socketEvents();
-    var User_1 = require_User();
-    var htmlSanitizer_1 = require_htmlSanitizer();
-    var log = (0, logger_1.default)(__filename);
-    function safeCallback(callback, payload) {
-      if (typeof callback === "function")
-        callback(payload);
-    }
-    async function handleChatMessage(message, callback, socket) {
-      log.debug(`Received chat message: ${JSON.stringify(message)}`);
-      try {
-        if (!message?.text?.trim()) {
-          safeCallback(callback, ClientError_1.ClientError.invalidError());
-          return;
-        }
-        if (message.text.length > htmlSanitizer_1.MAX_MESSAGE_CHARS) {
-          safeCallback(callback, ClientError_1.ClientError.tooLargeError());
-          return;
-        }
-        const repository = (0, config_1.getMessageRepository)();
-        message.username = socket.request.session.userInfo.username;
-        message.role = socket.request.session.userInfo.isAdmin ? User_1.RoleEnum.ADMIN : User_1.RoleEnum.NON_ADMIN;
-        message.text = (0, htmlSanitizer_1.sanitizeMessageHtml)(message.text);
-        if (!message.text.trim()) {
-          safeCallback(callback, ClientError_1.ClientError.invalidError());
-          return;
-        }
-        message.time = (/* @__PURE__ */ new Date()).toISOString();
-        const result = await repository.add(message);
-        safeCallback(callback, result);
-        socket.broadcast.emit(SocketEvents_1.socketEvents.chatMessage, message);
-      } catch (err) {
-        log.error(err);
-        safeCallback(callback, ClientError_1.ClientError.internalError());
-      }
-    }
-    async function handleEditMessage(updateMessage, socket, callback) {
-      log.debug(`Received edit message: ${JSON.stringify(updateMessage)}`);
-      try {
-        if (!updateMessage?.id || !updateMessage?.text?.trim()) {
-          safeCallback(callback, ClientError_1.ClientError.invalidError());
-          return;
-        }
-        if (updateMessage.text.length > htmlSanitizer_1.MAX_MESSAGE_CHARS) {
-          safeCallback(callback, ClientError_1.ClientError.tooLargeError());
-          return;
-        }
-        const repository = (0, config_1.getMessageRepository)();
-        const message = await repository.find(updateMessage.id);
-        if (!message) {
-          safeCallback(callback, ClientError_1.ClientError.notExistsError());
-          return;
-        }
-        const loggedInUser = socket.request.session.userInfo;
-        if (message.username != loggedInUser.username) {
-          safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
-          return;
-        }
-        message.text = (0, htmlSanitizer_1.sanitizeMessageHtml)(updateMessage.text);
-        if (!message.text.trim()) {
-          safeCallback(callback, ClientError_1.ClientError.invalidError());
-          return;
-        }
-        message.edited_at = (/* @__PURE__ */ new Date()).toISOString();
-        const updatedMessage = await repository.update(message);
-        safeCallback(callback, updatedMessage);
-        socket.broadcast.emit(SocketEvents_1.socketEvents.editedMessage, updatedMessage);
-      } catch (err) {
-        log.error(err);
-        safeCallback(callback, ClientError_1.ClientError.internalError());
-      }
-    }
-    async function handleReactMessage(reactedMessage, socket, callback) {
-      log.debug(`Received reaction to message: ${JSON.stringify(reactedMessage)}`);
-      try {
-        if (!reactedMessage?.id)
-          throw ClientError_1.ClientError.invalidError();
-        const repository = (0, config_1.getMessageRepository)();
-        const message = await repository.find(reactedMessage.id);
-        if (!message)
-          throw ClientError_1.ClientError.invalidError();
-        const curUserName = socket.request.session.userInfo.username;
-        if (!message.reactions || typeof message.reactions !== "object")
-          message.reactions = {};
-        for (const emoji of Object.keys(reactedMessage.reactions || {})) {
-          const incoming = reactedMessage.reactions[emoji];
-          if (!incoming || !Array.isArray(incoming.usernames))
-            continue;
-          if (!message.reactions[emoji] || !Array.isArray(message.reactions[emoji].usernames))
-            message.reactions[emoji] = { usernames: [] };
-          const userList = message.reactions[emoji].usernames;
-          const foundUsr = incoming.usernames.find((usrname) => usrname == curUserName);
-          const curUsr = userList.find((usrname) => usrname == curUserName);
-          if (foundUsr && !curUsr)
-            userList.push(curUserName);
-          else if (!foundUsr && curUsr)
-            message.reactions[emoji].usernames = userList.filter((usr) => usr != curUserName);
-        }
-        reactedMessage.reactions = message.reactions;
-        await repository.update(message);
-        safeCallback(callback, reactedMessage);
-        socket.broadcast.emit(SocketEvents_1.socketEvents.reactedMessage, reactedMessage);
-      } catch (err) {
-        log.error(err);
-        safeCallback(callback, ClientError_1.ClientError.internalError());
-      }
-    }
-    async function handleDeleteChat(socket, callback) {
-      log.debug(`Received delete chat request.`);
-      try {
-        if (!socket.request.session.userInfo.isAdmin) {
-          safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
-          return;
-        }
-        const repository = (0, config_1.getMessageRepository)();
-        await repository.removeAll();
-        safeCallback(callback, "ok");
-        socket.broadcast.emit(SocketEvents_1.socketEvents.chatDeleted);
-      } catch (err) {
-        log.error(err);
-        safeCallback(callback, ClientError_1.ClientError.internalError());
-      }
-    }
-    async function handleDeleteMessage(id, socket, callback) {
-      try {
-        if (!id) {
-          safeCallback(callback, ClientError_1.ClientError.invalidError());
-          return;
-        }
-        const loggedInUser = socket.request.session.userInfo;
-        const repository = (0, config_1.getMessageRepository)();
-        const message = await repository.find(id);
-        if (!message) {
-          safeCallback(callback, { status: false });
-          return;
-        }
-        if (message.username != loggedInUser.username && !loggedInUser.isAdmin) {
-          safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
-          return;
-        }
-        const result = await repository.remove(id);
-        if (result) {
-          log.debug(`Deleted message with id: ${id}`);
-          socket.broadcast.emit(SocketEvents_1.socketEvents.deletedMessage, id);
-          safeCallback(callback, { status: true });
-        } else {
-          log.debug(`Failed to delete msg ${id}, as the id doesn't exist`);
-          safeCallback(callback, { status: false });
-        }
-      } catch (err) {
-        log.error(err);
-        safeCallback(callback, { status: false, error: ClientError_1.ClientError.internalError() });
-      }
-    }
-    async function handleUpdateNotice(socket, callback) {
-      try {
-        if (!socket.request.session.userInfo?.isAdmin) {
-          safeCallback(callback, JSON.stringify({ success: false, error: "client_error.access_denied" }));
-          return;
-        }
-        socket.broadcast.emit(SocketEvents_1.socketEvents.updateNotice);
-        safeCallback(callback, JSON.stringify({ success: true }));
-      } catch (err) {
-        log.error(err);
-        safeCallback(callback, JSON.stringify({ success: false }));
-      }
-    }
-    async function handleUpdateFsNotice(socket, callback) {
-      try {
-        if (!socket.request.session.userInfo?.isAdmin) {
-          safeCallback(callback, JSON.stringify({ success: false, error: "client_error.access_denied" }));
-          return;
-        }
-        socket.broadcast.emit(SocketEvents_1.socketEvents.updateFsNotice);
-        safeCallback(callback, JSON.stringify({ success: true }));
-      } catch (err) {
-        log.error(err);
-        safeCallback(callback, JSON.stringify({ success: false }));
-      }
-    }
-  }
-});
-
-// server/src/socket/userHandler.js
-var require_userHandler = __commonJS({
-  "server/src/socket/userHandler.js"(exports2) {
-    "use strict";
-    var __importDefault = exports2 && exports2.__importDefault || function(mod) {
-      return mod && mod.__esModule ? mod : { "default": mod };
-    };
-    Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.broadcastUsersList = broadcastUsersList;
-    exports2.handleChangeStatus = handleChangeStatus;
-    exports2.handleTriggerTyping = handleTriggerTyping;
-    var logger_1 = __importDefault(require_logger2());
-    var UserDto_1 = require_UserDto();
-    var ClientError_1 = require_ClientError();
-    var UserCrudService_1 = require_userCrudService();
-    var config_1 = require_repositoryFactory();
-    var SocketEvents_1 = require_socketEvents();
-    var permissions_1 = require_permissions();
-    var log = (0, logger_1.default)(__filename);
-    var cachedUsers = [];
-    async function broadcastUsersList(io) {
-      try {
-        let dbUsers = await (0, UserCrudService_1.getUsers)();
-        dbUsers = dbUsers.filter((user) => user.active);
-        const activeUsers = getActiveUsers(io);
-        let updatedUsers = dbUsers.map((user) => updateUserStatus(user, activeUsers));
-        updatedUsers = updatedUsers.filter((user) => user.status === UserDto_1.userStatuses.online);
-        let setting = null;
-        try {
-          const settings = await (0, config_1.getSettingRepository)().get();
-          setting = settings[0] || null;
-        } catch (settingErr) {
-          log.error(settingErr);
-        }
-        const failOpen = setting === null;
-        for (const socket of io.sockets.sockets.values()) {
-          const session = socket.request?.session?.userInfo;
-          const maySeeAll = failOpen || (0, permissions_1.canSeeOnlineUsers)(setting, session);
-          const payload = maySeeAll ? updatedUsers : updatedUsers.filter((u) => u.username === session?.username);
-          socket.emit(SocketEvents_1.socketEvents.usersWithStatus, payload);
-        }
-      } catch (err) {
-        log.error(err);
-      }
-    }
-    function getActiveUsers(io) {
-      return Array.from(io.sockets.sockets.values()).map(({ id, handshake, request }) => {
-        const { time } = handshake;
-        const username = request.session.userInfo.username;
-        return { socketId: id, username, connectedAt: time };
-      });
-    }
-    function updateUserStatus(user, activeUsers) {
-      const activeUser = activeUsers.find((activeUser2) => activeUser2.username === user.username);
-      const time = activeUser ? new Date(activeUser.connectedAt).toISOString() : user.lastLoginDate || user.createdDate;
-      const socketId = activeUser ? activeUser.socketId : void 0;
-      const cachedUserIndex = cachedUsers.findIndex((cachedUser) => cachedUser.username === user.username);
-      const status = activeUser ? UserDto_1.userStatuses.online : UserDto_1.userStatuses.offline;
-      const updatedUser = {
-        username: user.username,
-        status,
-        time,
-        socketId,
-        active: user.active,
-        typing: false
-      };
-      if (cachedUserIndex === -1) {
-        cachedUsers.push(updatedUser);
-      } else {
-        cachedUsers[cachedUserIndex] = updatedUser;
-      }
-      return updatedUser;
-    }
-    async function handleChangeStatus(user, socket, callback) {
-      log.debug(`Received update status to user: ${JSON.stringify(user)}`);
-      try {
-        const username = socket.request.session.userInfo?.username;
-        const cuIndex = cachedUsers.findIndex((u) => u.username == username);
-        const cUser = cachedUsers[cuIndex];
-        if (cUser) {
-          cachedUsers[cuIndex].status = user?.status;
-          cachedUsers[cuIndex].username = username;
-          if (typeof callback === "function") {
-            callback(cUser);
-          }
-          socket.broadcast.emit(SocketEvents_1.socketEvents.changedStatus, cUser);
-        } else {
-          if (typeof callback === "function") {
-            callback({ ...user, username });
-          }
-        }
-      } catch (err) {
-        log.error(err);
-        if (typeof callback === "function")
-          callback(ClientError_1.ClientError.internalError());
-      }
-    }
-    var lastTypingBroadcast = /* @__PURE__ */ new Map();
-    var TYPING_MIN_INTERVAL_MS = 1200;
-    async function handleTriggerTyping(user, socket, callback) {
-      try {
-        const username = socket.request.session.userInfo?.username;
-        const typing = user?.typing !== false;
-        const now = Date.now();
-        const last = lastTypingBroadcast.get(username) || 0;
-        if (typing && now - last < TYPING_MIN_INTERVAL_MS) {
-          if (typeof callback === "function")
-            callback(JSON.stringify({ ...user, username, typing: true }));
-          return;
-        }
-        lastTypingBroadcast.set(username, now);
-        const payload = { ...user || {}, username, typing };
-        log.debug(`Broadcasting typing status: ${JSON.stringify(payload)}`);
-        if (typeof callback === "function") {
-          callback(JSON.stringify(payload));
-        }
-        socket.broadcast.emit(SocketEvents_1.socketEvents.typingMessage, payload);
-      } catch (err) {
-        log.error(err);
-        if (typeof callback === "function")
-          callback(JSON.stringify({ error: true }));
-      }
-    }
-  }
-});
-
-// server/src/models/Message.js
-var require_Message = __commonJS({
-  "server/src/models/Message.js"(exports2) {
-    "use strict";
-    Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.Message = void 0;
-    var BaseModel_1 = require_BaseModel();
-    var User_1 = require_User();
-    var ReplyTo = class {
-      id;
-      username;
-      text;
-      constructor(json) {
-        this.id = json.id;
-        this.text = typeof json.text === "string" ? json.text.substr(0, 50) : "";
-        this.username = json.username;
-      }
-    };
-    var Message = class extends BaseModel_1.BaseModel {
-      text;
-      username;
-      time;
-      replyTo;
-      edited_at;
-      role = User_1.RoleEnum.NON_ADMIN;
-      reactions;
-      constructor(json = {}) {
-        super(json);
-        this.text = json.text || "";
-        this.username = json.username || "";
-        this.time = json.time || "";
-        this.replyTo = json.replyTo ? new ReplyTo(json.replyTo) : null;
-        this.reactions = json.reactions || {};
-      }
-    };
-    exports2.Message = Message;
-  }
-});
-
-// server/src/socket/socketService.js
-var require_socketService = __commonJS({
-  "server/src/socket/socketService.js"(exports2) {
-    "use strict";
-    Object.defineProperty(exports2, "__esModule", { value: true });
-    var chatHandler_1 = require_chatHandler();
-    var userHandler_1 = require_userHandler();
-    var Message_1 = require_Message();
-    var SocketEvents_1 = require_socketEvents();
-    function socketService(io) {
-      const onConnection = (socket) => {
-        const sessionId = socket.request.session.id;
-        socket.join(sessionId);
-        socket.on(SocketEvents_1.socketEvents.disconnect, () => {
-          (0, userHandler_1.broadcastUsersList)(io);
-        });
-        (0, userHandler_1.broadcastUsersList)(io);
-        socket.on(SocketEvents_1.socketEvents.editMessage, (message, callback) => {
-          (0, chatHandler_1.handleEditMessage)(message, socket, callback);
-        });
-        socket.on(SocketEvents_1.socketEvents.reactMessage, (message, callback) => {
-          (0, chatHandler_1.handleReactMessage)(message, socket, callback);
-        });
-        socket.on(SocketEvents_1.socketEvents.deleteMessage, (id, callback) => {
-          (0, chatHandler_1.handleDeleteMessage)(id, socket, callback);
-        });
-        socket.on(SocketEvents_1.socketEvents.deleteChat, (callback) => {
-          (0, chatHandler_1.handleDeleteChat)(socket, callback);
-        });
-        socket.on(SocketEvents_1.socketEvents.chatMessage, (message, callback) => {
-          (0, chatHandler_1.handleChatMessage)(new Message_1.Message(message), callback, socket);
-        });
-        socket.on(SocketEvents_1.socketEvents.updateNotice, (callback) => {
-          (0, chatHandler_1.handleUpdateNotice)(socket, callback);
-        });
-        socket.on(SocketEvents_1.socketEvents.updateFsNotice, (callback) => {
-          (0, chatHandler_1.handleUpdateFsNotice)(socket, callback);
-        });
-        socket.on(SocketEvents_1.socketEvents.changeStatus, (user, callback) => {
-          (0, userHandler_1.handleChangeStatus)(user, socket, callback);
-        });
-        socket.on(SocketEvents_1.socketEvents.triggerTyping, (user, callback) => {
-          (0, userHandler_1.handleTriggerTyping)(user, socket, callback);
-        });
-      };
-      io.on("connection", onConnection);
-    }
-    exports2["default"] = socketService;
   }
 });
 
