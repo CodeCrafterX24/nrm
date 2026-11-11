@@ -72,6 +72,11 @@ body.bca-fslock { overflow: hidden !important; }
 .bca-fsok:hover { transform: translateY(-1px); filter: brightness(1.08); }
 .bca-fsok:active { transform: translateY(0); }
 
+/* owner request: button may sit left (default inline flow), centered or
+   right — set by the admin (fsNoticeBtnAlign) */
+.bca-fsoverlay.bca-fsok-align-center .bca-fstail { display: block !important; text-align: center; }
+.bca-fsoverlay.bca-fsok-align-right .bca-fstail { display: block !important; text-align: right; }
+
 @media (max-width: 600px) {
   .bca-fsinner { padding: 20px 14px calc(18px + env(safe-area-inset-bottom)); }
   .bca-fsbar { justify-content: stretch; }
@@ -126,6 +131,19 @@ body.bca-fslock { overflow: hidden !important; }
 }
 .bca-fseditor:focus { border-color: #4361ee; background: #fff; }
 .bca-fsbar2 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* button-label input + position select (same look as the editor inputs) */
+.bca-fsoklabel, .bca-fsalign {
+  width: 100%; box-sizing: border-box;
+  padding: 9px 12px;
+  border: 1.5px solid #dcdfe3;
+  border-radius: 10px;
+  background: #f7f8fa;
+  color: inherit;
+  font: 600 13.5px/1.4 inherit;
+  outline: none;
+}
+.bca-fsoklabel:focus, .bca-fsalign:focus { border-color: #4361ee; background: #fff; }
+.bca-fsalignlabel, .bca-fsoklabel-label { margin-top: 4px; }
 .bca-fscount { font-size: 12px; color: #65676b; }
 .bca-fscount.over { color: #d93025; font-weight: 700; }
 .bca-fsmsg { font-size: 12.5px; font-weight: 600; color: #0f9d58; }
@@ -200,3 +218,17 @@ body.bca-fs-dark .bca-fsadmincard .bca-fsmini {
 }
 body.bca-fs-dark .bca-fsadmincard .bca-fsmini:hover { background: #2b3037; }
 body.bca-fs-dark .bca-fsadmincard .bca-fssave { background: #4361ee; }
+/* dark mode for the button-label input + position select (owner report:
+   white-on-white — they shipped with light-only styling) */
+body.bca-fs-dark .bca-fsadmincard .bca-fsoklabel,
+body.bca-fs-dark .bca-fsadmincard .bca-fsalign {
+  background: #14161a;
+  color: #e8eaed;
+  border-color: #3a3f47;
+}
+body.bca-fs-dark .bca-fsadmincard .bca-fsoklabel:focus,
+body.bca-fs-dark .bca-fsadmincard .bca-fsalign:focus { border-color: #7c93ff; background: #14161a; }
+body.bca-fs-dark .bca-fsadmincard .bca-fsalign option {
+  background: #14161a;
+  color: #e8eaed;
+}

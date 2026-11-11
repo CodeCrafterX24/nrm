@@ -36938,23 +36938,23 @@ var require_logger2 = __commonJS({
     var path_1 = __importDefault(require("path"));
     var chatroom_react_express = winston_1.default.format.combine(winston_1.default.format.timestamp(), winston_1.default.format.errors({ stack: true }), winston_1.default.format.splat(), winston_1.default.format.printf((info) => `${info.timestamp} ${info.level} ${info.filename}: ${info.message} ${info.stack ? info.stack : ""}`));
     var logger = winston_1.default.createLogger({
-      level: "info",
+      // Owner request (2026-11-05): ALL logging off except errors —
+      // errors still reach chatroom_react_express-error.log and the console.
+      // Set LOG_LEVEL=debug (env) to temporarily bring info/debug logs back.
+      level: process.env.LOG_LEVEL || "error",
       format: chatroom_react_express,
       transports: [
         //
-        // - Write all logs with importance level of `error` or higher to `error.log`
-        // - Write all logs with importance level of `info` or higher to `chatroom_react_express.log`
+        // - Write all logs with importance level of `error` or higher to the error file
+        //   (info/debug chatter is disabled; no combined info log file anymore)
         //
         new winston_1.default.transports.File({
           filename: "chatroom_react_express-error.log",
           level: "error"
         }),
-        new winston_1.default.transports.File({ filename: "chatroom_react_express.log" }),
-        // - Write all logs with importance level of `info` or higher to console
-        // - If we're not in production then set level to debug
+        // - Console mirrors the same error-only level
         new winston_1.default.transports.Console({
-          format: chatroom_react_express,
-          ...process.env.NODE_ENV === "development" && { level: "debug" }
+          format: chatroom_react_express
         })
       ]
     });
@@ -38961,6 +38961,8 @@ var require_storageTypes = __commonJS({
       StorageModels2["User"] = "User";
       StorageModels2["Setting"] = "Setting";
       StorageModels2["Message"] = "Message";
+      StorageModels2["Note"] = "Note";
+      StorageModels2["Media"] = "Media";
     })(StorageModels || (exports2.StorageModels = StorageModels = {}));
     var StorageTypes;
     (function(StorageTypes2) {
@@ -45683,6 +45685,8 @@ var require_BaseGistRepository = __commonJS({
             return;
           } catch (err) {
             log.error(`gist load attempt ${i}/${attempts} for ${this.modelName} failed: ${err.message}`);
+            if (i === attempts && /Malformed UTF-8|empty output|utf-8/i.test(err.message))
+              log.error(`${this.modelName}: the stored gist could not be DECRYPTED with the current env encryption_password \u2014 either the password changed since the gist was written, or APP_ID points at another room's gists. Fix the env (same encryption_password + same APP_ID as the deploy that created the gists) and restart; the stored data itself is intact.`);
             if (i === attempts)
               throw err;
             await new Promise((r) => setTimeout(r, Math.min(i * 5, 30) * 1e3));
@@ -46317,6 +46321,164 @@ var require_ShardedGistMessageRepository = __commonJS({
   }
 });
 
+// server/src/repositories/ShardedNoteRepository.js
+var require_ShardedNoteRepository = __commonJS({
+  "server/src/repositories/ShardedNoteRepository.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.ShardedNoteRepository = void 0;
+    var logger_1 = require_logger2();
+    var BaseGistRepository_1 = require_BaseGistRepository();
+    var log = (0, logger_1.default)(__filename);
+    var { APP_NAMESPACE } = BaseGistRepository_1;
+    var SHARD_LIMIT = Math.max(parseInt(process.env.GIST_SHARD_BYTES || "500000", 10), 1e3);
+    var ShardedNoteRepository = class extends BaseGistRepository_1.BaseGistRepository {
+      /** [{ index, gistId, minId, maxId, sizeBytes }] sorted by index */
+      shards = [];
+      dirty = /* @__PURE__ */ new Set();
+      get descriptionPrefix() {
+        return `${APP_NAMESPACE}Storage_${this.modelName}_`;
+      }
+      description(index) {
+        return `${APP_NAMESPACE}Storage_${this.modelName}_${index}`;
+      }
+      filename(index) {
+        return `${this.modelName.toLowerCase()}-data-${index}.json`;
+      }
+      // ---------- load ----------
+      async loadOnce() {
+        log.info(`loading ${this.modelName} from sharded gists...`);
+        const gists = await this.listGists();
+        const shardRe = new RegExp(`^${this.descriptionPrefix}(\\d+)$`);
+        const mine = gists.map((g) => {
+          const m = g.description && shardRe.exec(g.description);
+          return m ? { index: Number(m[1]), gistId: g.id } : null;
+        }).filter(Boolean).sort((a, b) => a.index - b.index);
+        const items = [];
+        const shards = [];
+        for (const shard of mine) {
+          const content = await this.readGistFile(shard.gistId, this.filename(shard.index));
+          if (content == null) {
+            log.warn(`shard ${shard.index} has no file, skipping`);
+            continue;
+          }
+          const parsed = JSON.parse(this.decrypt(content));
+          const arr = Array.isArray(parsed) ? parsed : parsed[this.modelName];
+          if (!Array.isArray(arr))
+            throw new Error(`unexpected payload in shard ${shard.index}`);
+          const ids = arr.map((x) => Number(x.id) || 0);
+          items.push(...arr);
+          shards.push({
+            index: shard.index,
+            gistId: shard.gistId,
+            minId: ids.length ? Math.min(...ids) : 0,
+            maxId: ids.length ? Math.max(...ids) : 0,
+            sizeBytes: JSON.stringify({ [this.modelName]: arr }).length
+          });
+        }
+        const byId = /* @__PURE__ */ new Map();
+        for (const it of items) {
+          if (it && typeof it === "object" && it.id != null)
+            byId.set(Number(it.id), it);
+        }
+        this.items = [...byId.values()].sort((a, b) => a.id - b.id);
+        this.shards = shards;
+        this.maxId = this.items.reduce((mx, it) => Math.max(mx, Number(it.id) || 0), this.maxId);
+        log.info(`${this.modelName} loaded: ${this.items.length} chunk(s) across ${this.shards.length} shard(s)`);
+      }
+      // ---------- shard helpers ----------
+      shardForId(id) {
+        for (let i = this.shards.length - 1; i >= 0; i--) {
+          const s = this.shards[i];
+          if (id >= s.minId && id <= s.maxId)
+            return s;
+        }
+        return this.shards[this.shards.length - 1] || null;
+      }
+      lastShard() {
+        return this.shards[this.shards.length - 1] || null;
+      }
+      itemsInShard(shard) {
+        return this.items.filter((it) => it.id >= shard.minId && it.id <= shard.maxId);
+      }
+      nextIndex() {
+        return this.shards.length ? this.shards[this.shards.length - 1].index + 1 : 1;
+      }
+      // ---------- hooks ----------
+      afterAdd(item) {
+        const itemSize = JSON.stringify({ [this.modelName]: [item] }).length;
+        let shard = this.lastShard();
+        if (!shard || shard.sizeBytes + itemSize > SHARD_LIMIT) {
+          shard = { index: this.nextIndex(), gistId: null, minId: item.id, maxId: item.id, sizeBytes: 0 };
+          this.shards.push(shard);
+        }
+        shard.maxId = Math.max(shard.maxId, item.id);
+        shard.sizeBytes += itemSize;
+        this.dirty.add(shard.index);
+      }
+      afterUpdate(item) {
+        const shard = this.shardForId(item.id);
+        if (shard)
+          this.dirty.add(shard.index);
+      }
+      afterRemove(id) {
+        const shard = this.shardForId(id);
+        if (shard)
+          this.dirty.add(shard.index);
+      }
+      afterRemoveAll() {
+        for (const shard of this.shards)
+          this.deleteGist(shard.gistId).catch((err) => log.error(`deleting shard gist ${shard.gistId} failed: ${err.message}`));
+        this.shards = [];
+        this.dirty.clear();
+      }
+      // ---------- flush ----------
+      async flush() {
+        if (!this.dirty.size || this.flushBusy)
+          return;
+        this.flushBusy = true;
+        try {
+          while (this.dirty.size) {
+            const index = this.dirty.values().next().value;
+            this.dirty.delete(index);
+            const shard = this.shards.find((s) => s.index === index);
+            if (!shard)
+              continue;
+            const arr = this.itemsInShard(shard);
+            if (!arr.length) {
+              if (shard.gistId && this.shards.length > 1) {
+                await this.deleteGist(shard.gistId);
+                this.shards = this.shards.filter((s) => s.index !== index);
+                log.info(`empty shard ${index} deleted`);
+              }
+              continue;
+            }
+            const json = JSON.stringify({ [this.modelName]: arr });
+            if (json.length > 9e5) {
+              log.error(`shard ${index} payload is ${json.length} bytes \u2014 too large for a gist file; skipping write (lower NOTE_CHUNK_CHARS)`);
+              continue;
+            }
+            shard.sizeBytes = json.length;
+            const encrypted = this.encrypt(json);
+            if (shard.gistId) {
+              await this.updateGist(shard.gistId, this.filename(index), encrypted);
+            } else {
+              shard.gistId = await this.createGist(this.description(index), this.filename(index), encrypted);
+              log.info(`created shard ${index} gist ${shard.gistId}`);
+            }
+          }
+        } catch (err) {
+          log.error(`note flush failed (will retry): ${err.message}`);
+          this.scheduleFlush();
+        } finally {
+          this.flushBusy = false;
+        }
+      }
+    };
+    exports2.ShardedNoteRepository = ShardedNoteRepository;
+  }
+});
+
 // server/src/config/repositoryFactory.js
 var require_repositoryFactory = __commonJS({
   "server/src/config/repositoryFactory.js"(exports2) {
@@ -46337,6 +46499,7 @@ var require_repositoryFactory = __commonJS({
     var PtStorageRepositoryImpl_1 = require_PtStorageRepositoryImpl();
     var MemoryGistRepository_1 = require_MemoryGistRepository();
     var ShardedGistMessageRepository_1 = require_ShardedGistMessageRepository();
+    var ShardedNoteRepository_1 = require_ShardedNoteRepository();
     var log = (0, logger_1.default)(__filename);
     function getRepository(storageModel, storageType) {
       let repository = null;
@@ -46365,7 +46528,7 @@ var require_repositoryFactory = __commonJS({
                 break;
               }
               const credentials = { token: githubGist_token, username: githubGist_username };
-              repository = storageModel === Storage_1.StorageModels.Message ? new ShardedGistMessageRepository_1.ShardedGistMessageRepository(credentials, storageModel, encryption_password) : new MemoryGistRepository_1.MemoryGistRepository(credentials, storageModel, encryption_password);
+              repository = storageModel === Storage_1.StorageModels.Message ? new ShardedGistMessageRepository_1.ShardedGistMessageRepository(credentials, storageModel, encryption_password) : storageModel === Storage_1.StorageModels.Note ? new ShardedNoteRepository_1.ShardedNoteRepository(credentials, storageModel, encryption_password) : new MemoryGistRepository_1.MemoryGistRepository(credentials, storageModel, encryption_password);
               break;
             }
             default:
@@ -58938,6 +59101,9 @@ var require_htmlSanitizer = __commonJS({
     var MAX_NOTICE_CHARS = parseInt(process.env.MAX_NOTICE_CHARS || "20000", 10);
     exports2.MAX_NOTICE_CHARS = MAX_NOTICE_CHARS;
     var baseOptions = {
+      // `style` in allowedTags is the owner-approved HTML+CSS feature (রি-২) —
+      // the library's per-call XSS nag is silenced; sanitization behavior is unchanged.
+      allowVulnerableTags: true,
       allowedTags: [
         ...sanitize_html_1.default.defaults.allowedTags,
         "img",
@@ -58981,6 +59147,180 @@ var require_htmlSanitizer = __commonJS({
       if (typeof text !== "string")
         return "";
       return (0, sanitize_html_1.default)(text, baseOptions);
+    }
+  }
+});
+
+// server/src/services/mediaStore.js
+var require_mediaStore = __commonJS({
+  "server/src/services/mediaStore.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.MEDIA_MAX_BASE64_CHARS = exports2.MAX_MEDIA_SECONDS = void 0;
+    exports2.putMedia = putMedia;
+    exports2.getMedia = getMedia;
+    exports2.removeMedia = removeMedia;
+    exports2.removeAllMedia = removeAllMedia;
+    exports2.mediaInfo = mediaInfo;
+    var logger_1 = require_logger2();
+    var Storage_1 = require_storageTypes();
+    var ShardedNoteRepository_1 = require_ShardedNoteRepository();
+    var DiskStorageRepositoryImpl_1 = require_DiskStorageRepositoryImpl();
+    var log = (0, logger_1.default)(__filename);
+    var MAX_MEDIA_SECONDS = 180;
+    exports2.MAX_MEDIA_SECONDS = MAX_MEDIA_SECONDS;
+    var MEDIA_MAX_BASE64_CHARS = 3e5;
+    exports2.MEDIA_MAX_BASE64_CHARS = MEDIA_MAX_BASE64_CHARS;
+    var mediaRepository = null;
+    function getMediaRepository() {
+      if (!mediaRepository) {
+        const defaultStorage = process.env.REPOSITORY_NAME || Storage_1.StorageTypes.diskStorage;
+        const storageType = defaultStorage === Storage_1.StorageTypes.githubGistStorage ? Storage_1.StorageTypes.githubGistStorage : Storage_1.StorageTypes.diskStorage;
+        if (storageType === Storage_1.StorageTypes.githubGistStorage) {
+          const token = process.env.githubGist_token ?? "";
+          const username = process.env.githubGist_username ?? "";
+          if (!token || !username) {
+            log.error("githubGist env vars are required for githubGistStorage (Media)");
+            throw new Error("gist credentials missing for Media storage");
+          }
+          mediaRepository = new ShardedNoteRepository_1.ShardedNoteRepository(
+            { token, username },
+            Storage_1.StorageModels.Media,
+            process.env.encryption_password ?? ""
+          );
+        } else {
+          mediaRepository = new DiskStorageRepositoryImpl_1.DiskStorageRepositoryImpl(Storage_1.StorageModels.Media);
+        }
+      }
+      return mediaRepository;
+    }
+    var index = /* @__PURE__ */ new Map();
+    async function indexAll() {
+      const repo = getMediaRepository();
+      const items = await repo.get();
+      index.clear();
+      for (const it of items) {
+        if (it && typeof it.mediaId === "string") {
+          index.set(it.mediaId, { item: it, at: Date.now() });
+        }
+      }
+    }
+    var ensured = false;
+    async function ensureIndex() {
+      if (ensured)
+        return;
+      await indexAll();
+      ensured = true;
+    }
+    async function putMedia({ mime, data }) {
+      if (typeof mime !== "string" || !/^image\/(png|jpeg|webp|gif)$|^audio\/(webm|ogg|mp4|mpeg)$/.test(mime))
+        throw new Error("unsupported media type");
+      if (typeof data !== "string" || !data.length)
+        throw new Error("empty media payload");
+      if (data.length > MEDIA_MAX_BASE64_CHARS)
+        throw new Error("media too large");
+      await ensureIndex();
+      const repo = getMediaRepository();
+      const mediaId = "m" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      const item = { mediaId, mime, data, bytes: Math.floor(data.length * 0.75), createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+      await repo.add(item);
+      index.set(mediaId, { item, at: Date.now() });
+      if (index.size > 200) {
+        let oldestKey = null, oldestAt = Infinity;
+        for (const [k, v] of index) {
+          if (v.at < oldestAt) {
+            oldestAt = v.at;
+            oldestKey = k;
+          }
+        }
+        if (oldestKey && oldestKey !== mediaId) index.delete(oldestKey);
+      }
+      log.info(`media stored: ${mediaId} ${mime} ${item.bytes}B`);
+      return { mediaId, bytes: item.bytes };
+    }
+    async function getMedia(mediaId) {
+      if (typeof mediaId !== "string" || !/^m[0-9a-z]+$/.test(mediaId))
+        return null;
+      await ensureIndex();
+      let hit = index.get(mediaId);
+      if (!hit || !hit.item || typeof hit.item.data !== "string") {
+        const repo = getMediaRepository();
+        const found = (await repo.get()).find((it) => it && it.mediaId === mediaId);
+        if (!found) return null;
+        hit = { item: found, at: Date.now() };
+        index.set(mediaId, hit);
+      }
+      hit.at = Date.now();
+      return { mime: hit.item.mime, data: hit.item.data, bytes: hit.item.bytes };
+    }
+    async function removeMedia(mediaId) {
+      if (typeof mediaId !== "string") return false;
+      await ensureIndex();
+      const hit = index.get(mediaId);
+      if (hit) {
+        const repo2 = getMediaRepository();
+        await repo2.remove(hit.item.id);
+        index.delete(mediaId);
+        return true;
+      }
+      const repo = getMediaRepository();
+      const found = (await repo.get()).find((it) => it && it.mediaId === mediaId);
+      if (!found) return false;
+      await repo.remove(found.id);
+      return true;
+    }
+    async function removeAllMedia() {
+      const repo = getMediaRepository();
+      await repo.removeAll();
+      index.clear();
+    }
+    async function sweepListItems() {
+      await ensureIndex();
+      const repo = getMediaRepository();
+      const items = await repo.get();
+      return items.filter((it) => it && typeof it.mediaId === "string").map((it) => ({ id: it.id, mediaId: it.mediaId, createdAt: it.createdAt || "" }));
+    }
+    async function sweepRemoveById(durableId) {
+      const repo = getMediaRepository();
+      await repo.remove(durableId);
+    }
+    exports2.sweepListItems = sweepListItems;
+    exports2.sweepRemoveById = sweepRemoveById;
+    async function sweepUnreferenced(referenced, cutoffMs) {
+      await ensureIndex();
+      const repo = getMediaRepository();
+      const items = await repo.get();
+      let count = 0, keptRef2 = 0, keptFresh2 = 0;
+      for (const it of items) {
+        if (!it || typeof it.mediaId !== "string") continue;
+        if (referenced.has(it.mediaId)) {
+          keptRef2++;
+          continue;
+        }
+        const created = Date.parse(it.createdAt || "") || 0;
+        if (created > cutoffMs) {
+          keptFresh2++;
+          continue;
+        }
+        try {
+          await repo.remove(it.id);
+          count++;
+          index.delete(it.mediaId);
+        } catch (err) {
+          log.error(`media sweep: removing ${it.mediaId} failed: ${err.message}`);
+        }
+      }
+      return { count, keptRef: keptRef2, keptFresh: keptFresh2 };
+    }
+    exports2.sweepUnreferenced = sweepUnreferenced;
+    async function mediaInfo(mediaId) {
+      if (typeof mediaId !== "string" || !/^m[0-9a-z]+$/.test(mediaId))
+        return null;
+      await ensureIndex();
+      const hit = index.get(mediaId);
+      if (hit) return { mime: hit.item.mime, bytes: hit.item.bytes };
+      const found = (await getMediaRepository().get()).find((it) => it && it.mediaId === mediaId);
+      return found ? { mime: found.mime, bytes: found.bytes } : null;
     }
   }
 });
@@ -59194,6 +59534,12 @@ ${messages.length ? cards.join("\n") : `  <div class="msg">${escapeHtml(i18n.emp
     var deleteAllChat = async (res) => {
       const repository = (0, config_1.getMessageRepository)();
       await repository.removeAll();
+      try {
+        const mediaStore = require_mediaStore();
+        await mediaStore.removeAllMedia();
+      } catch (err) {
+        log.error("media cleanup after delete-all failed:", err.message);
+      }
     };
     exports2.deleteAllChat = deleteAllChat;
   }
@@ -59228,6 +59574,8 @@ var require_Setting = __commonJS({
       fsNotice: 1e5,
       /** fullscreen-notice confirm button label (plain text, short) */
       fsNoticeOkLabel: 60,
+      /** fullscreen-notice button position: left | center | right */
+      fsNoticeBtnAlign: 6,
       /** one username entry */
       username: 50,
       /** members of a selected-users list */
@@ -59349,6 +59697,15 @@ var require_Setting = __commonJS({
       attendanceViewMode;
       /** usernames allowed to open the attendance page when the mode is "selected" */
       attendanceSelected;
+      /** who may delete the whole chat history — "all" | "admin" | "selected" */
+      deleteChatMode;
+      /** usernames allowed to delete the whole history when deleteChatMode === "selected" */
+      deleteChatSelected;
+      /** who may send media messages (voice/photo) — "all" | "admin" | "selected";
+          admins always can (owner request 2026-11-09: per-feature media on/off) */
+      mediaMode;
+      /** usernames allowed to send media when mediaMode === "selected" */
+      mediaSelected;
       /** raw, admin-editiable html rendered by GET /attendance */
       attendanceHtml;
       /** shared plain-text note shown on the attendance page (admin + selected users) */
@@ -59359,6 +59716,8 @@ var require_Setting = __commonJS({
       fsNoticeUpdatedAt;
       /** custom text for the fullscreen-notice confirm button ("" = default) */
       fsNoticeOkLabel;
+      /** button position inside the fullscreen overlay: left (default) | center | right */
+      fsNoticeBtnAlign;
       /** where new chat messages persist: "gist" (durable, slower) | "memory"
           (server-local, fast — lost on restart/redeploy). User+Setting always
           persist in the gist regardless. */
@@ -59380,11 +59739,16 @@ var require_Setting = __commonJS({
         this.onlineUsersSelected = normalizeUsernames(json.onlineUsersSelected);
         this.attendanceViewMode = normalizeMode(json.attendanceViewMode, "admin") === "all" ? "admin" : normalizeMode(json.attendanceViewMode, "admin");
         this.attendanceSelected = normalizeUsernames(json.attendanceSelected);
+        this.deleteChatMode = normalizeMode(json.deleteChatMode, "admin");
+        this.deleteChatSelected = normalizeUsernames(json.deleteChatSelected);
+        this.mediaMode = normalizeMode(json.mediaMode, "all");
+        this.mediaSelected = normalizeUsernames(json.mediaSelected);
         this.attendanceHtml = typeof json.attendanceHtml === "string" ? json.attendanceHtml.slice(0, SETTING_LIMITS.attendanceHtml) : "";
         this.attendanceNote = typeof json.attendanceNote === "string" ? json.attendanceNote.slice(0, SETTING_LIMITS.attendanceNote) : "";
         this.fsNotice = typeof json.fsNotice === "string" ? json.fsNotice.slice(0, SETTING_LIMITS.fsNotice) : "";
         this.fsNoticeUpdatedAt = typeof json.fsNoticeUpdatedAt === "string" ? json.fsNoticeUpdatedAt : "";
         this.fsNoticeOkLabel = typeof json.fsNoticeOkLabel === "string" ? json.fsNoticeOkLabel.slice(0, SETTING_LIMITS.fsNoticeOkLabel) : "";
+        this.fsNoticeBtnAlign = json.fsNoticeBtnAlign === "center" || json.fsNoticeBtnAlign === "right" ? json.fsNoticeBtnAlign : "left";
         this.messageStoreMode = json.messageStoreMode === "gist" ? "gist" : "memory";
       }
     };
@@ -59506,6 +59870,16 @@ var require_permissions = __commonJS({
       setting?.attendanceSelected,
       user
     );
+    var canDeleteAllChat = (setting, user) => canUseFeature(
+      normalizeMode(setting?.deleteChatMode, "admin"),
+      setting?.deleteChatSelected,
+      user
+    );
+    var canUseMedia = (setting, user) => canUseFeature(
+      normalizeMode(setting?.mediaMode, "all"),
+      setting?.mediaSelected,
+      user
+    );
     var permissionSummary = (setting, user) => ({
       copyAllMode: normalizeMode(setting?.copyAllMode, "all"),
       copyAllSelectedCount: memberList(setting?.copyAllSelected).length,
@@ -59516,6 +59890,12 @@ var require_permissions = __commonJS({
       attendanceMode: normalizeMode(setting?.attendanceViewMode, "admin"),
       attendanceSelectedCount: memberList(setting?.attendanceSelected).length,
       canViewAttendance: canViewAttendance(setting, user),
+      deleteChatMode: normalizeMode(setting?.deleteChatMode, "admin"),
+      deleteChatSelectedCount: memberList(setting?.deleteChatSelected).length,
+      canDeleteAllChat: canDeleteAllChat(setting, user),
+      mediaMode: normalizeMode(setting?.mediaMode, "all"),
+      mediaSelectedCount: memberList(setting?.mediaSelected).length,
+      canUseMedia: canUseMedia(setting, user),
       hasAttendanceHtml: typeof setting?.attendanceHtml === "string" && setting.attendanceHtml.length > 0,
       version: isset(setting?.version) ? setting.version : void 0
     });
@@ -59525,14 +59905,20 @@ var require_permissions = __commonJS({
       showOnlineUsers: normalizeMode(setting?.showOnlineUsers, "all"),
       onlineUsersSelected: memberList(setting?.onlineUsersSelected),
       attendanceMode: normalizeMode(setting?.attendanceViewMode, "admin"),
-      attendanceSelected: memberList(setting?.attendanceSelected)
+      attendanceSelected: memberList(setting?.attendanceSelected),
+      deleteChatMode: normalizeMode(setting?.deleteChatMode, "admin"),
+      deleteChatSelected: memberList(setting?.deleteChatSelected),
+      mediaMode: normalizeMode(setting?.mediaMode, "all"),
+      mediaSelected: memberList(setting?.mediaSelected)
     });
     exports2.MODES = MODES;
     exports2.adminSettingsPayload = adminSettingsPayload;
     exports2.canSeeOnlineUsers = canSeeOnlineUsers;
     exports2.canUseCopyAll = canUseCopyAll;
+    exports2.canUseMedia = canUseMedia;
     exports2.canUseFeature = canUseFeature;
     exports2.canViewAttendance = canViewAttendance;
+    exports2.canDeleteAllChat = canDeleteAllChat;
     exports2.isListed = isListed;
     exports2.normalizeMode = normalizeMode;
     exports2.permissionSummary = permissionSummary;
@@ -59611,6 +59997,121 @@ var require_attendanceService = __commonJS({
   }
 });
 
+// server/src/services/noteStore.js
+var require_noteStore = __commonJS({
+  "server/src/services/noteStore.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.NOTE_CHUNK_CHARS = void 0;
+    exports2.readNote = readNote;
+    exports2.writeNote = writeNote;
+    var logger_1 = require_logger2();
+    var Storage_1 = require_storageTypes();
+    var ShardedNoteRepository_1 = require_ShardedNoteRepository();
+    var DiskStorageRepositoryImpl_1 = require_DiskStorageRepositoryImpl();
+    var log = (0, logger_1.default)(__filename);
+    var NOTE_CHUNK_CHARS = Math.max(parseInt(process.env.NOTE_CHUNK_CHARS || "400000", 10), 1e4);
+    exports2.NOTE_CHUNK_CHARS = NOTE_CHUNK_CHARS;
+    var noteRepository = null;
+    function getNoteRepository() {
+      if (!noteRepository) {
+        const defaultStorage = process.env.REPOSITORY_NAME || Storage_1.StorageTypes.diskStorage;
+        const storageType = defaultStorage === Storage_1.StorageTypes.githubGistStorage ? Storage_1.StorageTypes.githubGistStorage : Storage_1.StorageTypes.diskStorage;
+        if (storageType === Storage_1.StorageTypes.githubGistStorage) {
+          const token = process.env.githubGist_token ?? "";
+          const username = process.env.githubGist_username ?? "";
+          if (!token || !username) {
+            log.error("githubGist env vars are required for githubGistStorage (Note)");
+            throw new Error("gist credentials missing for Note storage");
+          }
+          noteRepository = new ShardedNoteRepository_1.ShardedNoteRepository(
+            { token, username },
+            Storage_1.StorageModels.Note,
+            process.env.encryption_password ?? ""
+          );
+        } else {
+          noteRepository = new DiskStorageRepositoryImpl_1.DiskStorageRepositoryImpl(Storage_1.StorageModels.Note);
+        }
+      }
+      return noteRepository;
+    }
+    async function readNote() {
+      const repo = getNoteRepository();
+      const items = await repo.get();
+      return items.slice().sort((a, b) => a.id - b.id).map((it) => typeof it.chunk === "string" ? it.chunk : "").join("");
+    }
+    async function writeNote(text) {
+      const safe = typeof text === "string" ? text : "";
+      const chunks = [];
+      for (let i = 0; i < safe.length; i += NOTE_CHUNK_CHARS) {
+        chunks.push(safe.slice(i, i + NOTE_CHUNK_CHARS));
+      }
+      const repo = getNoteRepository();
+      const existing = (await repo.get()).slice().sort((a, b) => a.id - b.id);
+      let changed = 0;
+      const keep = Math.min(existing.length, chunks.length);
+      for (let i = 0; i < keep; i++) {
+        if (existing[i].chunk !== chunks[i]) {
+          existing[i].chunk = chunks[i];
+          await repo.update(existing[i]);
+          changed++;
+        }
+      }
+      if (chunks.length > existing.length) {
+        for (let i = keep; i < chunks.length; i++) {
+          await repo.add({ chunk: chunks[i] });
+          changed++;
+        }
+      } else if (existing.length > chunks.length) {
+        for (let i = keep; i < existing.length; i++) {
+          await repo.remove(existing[i].id);
+          changed++;
+        }
+      }
+      if (changed)
+        log.info(`note saved: ${safe.length} chars in ${chunks.length} chunk(s) (${changed} chunk write(s))`);
+      return { chars: safe.length, chunks: chunks.length };
+    }
+  }
+});
+
+// server/src/services/noteService.js
+var require_noteService = __commonJS({
+  "server/src/services/noteService.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.SEPARATOR = void 0;
+    exports2.splitNoteTabs = splitNoteTabs;
+    exports2.joinNoteTabs = joinNoteTabs;
+    exports2.getNoteState = getNoteState;
+    exports2.saveNoteText = saveNoteText;
+    var NoteService_1 = require_noteService();
+    var noteStore_1 = require_noteStore();
+    var CryptoJS = require_crypto_js();
+    var SEPARATOR = CryptoJS.SHA512("-- tab separator --").toString();
+    exports2.SEPARATOR = SEPARATOR;
+    var MAX_NOTE_CHARS = Math.max(parseInt(process.env.MAX_NOTE_CHARS || "10000000", 10), 1e5);
+    exports2.MAX_NOTE_CHARS = MAX_NOTE_CHARS;
+    function splitNoteTabs(text) {
+      return typeof text === "string" && text ? text.split(SEPARATOR) : [""];
+    }
+    function joinNoteTabs(parts) {
+      const safe = Array.isArray(parts) ? parts.filter((p) => typeof p === "string") : [];
+      const clean = safe.length ? safe : [""];
+      return clean.some((p) => p !== "") ? clean.join(SEPARATOR) : "";
+    }
+    async function getNoteState() {
+      const text = await noteStore_1.readNote();
+      return { text, tabs: splitNoteTabs(text).length };
+    }
+    async function saveNoteText(text) {
+      const joined = joinNoteTabs(splitNoteTabs(typeof text === "string" ? text : ""));
+      const res = await noteStore_1.writeNote(joined);
+      return { chars: res.chars, tabs: splitNoteTabs(joined).length };
+    }
+  }
+});
+
 // server/src/controllers/settingController.js
 var require_settingController = __commonJS({
   "server/src/controllers/settingController.js"(exports2) {
@@ -59636,7 +60137,7 @@ var require_settingController = __commonJS({
       try {
         const repository = (0, config_1.getSettingRepository)();
         const setting = await getSetting();
-        const { copyAllMode, copyAllSelected, showOnlineUsers, onlineUsersSelected, attendanceViewMode, attendanceSelected } = req.body || {};
+        const { copyAllMode, copyAllSelected, showOnlineUsers, onlineUsersSelected, attendanceViewMode, attendanceSelected, deleteChatMode, deleteChatSelected, mediaMode, mediaSelected } = req.body || {};
         if (copyAllMode !== void 0) {
           if (!permissions_1.MODES.includes(copyAllMode))
             return res.sendStatus(400);
@@ -59659,6 +60160,20 @@ var require_settingController = __commonJS({
         }
         if (attendanceSelected !== void 0)
           setting.attendanceSelected = (0, Setting_1.normalizeUsernames)(attendanceSelected);
+        if (deleteChatMode !== void 0) {
+          if (!permissions_1.MODES.includes(deleteChatMode))
+            return res.sendStatus(400);
+          setting.deleteChatMode = deleteChatMode;
+        }
+        if (deleteChatSelected !== void 0)
+          setting.deleteChatSelected = (0, Setting_1.normalizeUsernames)(deleteChatSelected);
+        if (mediaMode !== void 0) {
+          if (!permissions_1.MODES.includes(mediaMode))
+            return res.sendStatus(400);
+          setting.mediaMode = mediaMode;
+        }
+        if (mediaSelected !== void 0)
+          setting.mediaSelected = (0, Setting_1.normalizeUsernames)(mediaSelected);
         await repository.update(setting);
         res.status(200).json((0, permissions_1.permissionSummary)(setting, req.session?.userInfo));
       } catch (error) {
@@ -59712,7 +60227,8 @@ var require_settingController = __commonJS({
         const user = req.session?.userInfo;
         if (!(0, permissions_1.canViewAttendance)(setting, user))
           return res.sendStatus(403);
-        res.status(200).json({ note: typeof setting.attendanceNote === "string" ? setting.attendanceNote : "" });
+        const state = await NoteService_1.getNoteState();
+        res.status(200).json({ note: state.text, tabs: state.tabs });
       } catch (error) {
         handleError(error, res);
       }
@@ -59724,14 +60240,13 @@ var require_settingController = __commonJS({
         const user = req.session?.userInfo;
         if (!(0, permissions_1.canViewAttendance)(setting, user))
           return res.sendStatus(403);
-        const note = (0, attendanceService_1.validateAttendanceNote)(req.body?.note);
-        if (note === null)
-          return res.status(400).json({ errorMessage: "client_error.too_large_error" });
-        const repository = (0, config_1.getSettingRepository)();
-        setting.attendanceNote = note;
-        await repository.update(setting);
-        log.info(`attendance note saved (${note.length} chars)`);
-        res.status(200).json({ note });
+        if (typeof req.body?.note !== "string")
+          return res.status(400).json({ errorMessage: "client_error.client_error" });
+        if (req.body.note.length > NoteService_1.MAX_NOTE_CHARS)
+          return res.status(413).json({ errorMessage: "client_error.too_large_error" });
+        const state = await NoteService_1.saveNoteText(req.body.note);
+        log.info(`note saved (${state.chars} chars, ${state.tabs} tabs)`);
+        res.status(200).json({ note: (await NoteService_1.getNoteState()).text, tabs: state.tabs });
       } catch (error) {
         handleError(error, res);
       }
@@ -59746,6 +60261,7 @@ var require_settingController = __commonJS({
     var htmlSanitizer_1 = require_htmlSanitizer();
     var permissions_1 = require_permissions();
     var attendanceService_1 = require_attendanceService();
+    var NoteService_1 = require_noteService();
     var repositoryFactoryRef = require_repositoryFactory();
     var log = (0, logger_1.default)(__filename);
     async function getSetting() {
@@ -59823,6 +60339,7 @@ var require_settingController = __commonJS({
           notice: setting.fsNotice || "",
           updatedAt: setting.fsNoticeUpdatedAt || "",
           okLabel: setting.fsNoticeOkLabel || "",
+          btnAlign: setting.fsNoticeBtnAlign === "center" || setting.fsNoticeBtnAlign === "right" ? setting.fsNoticeBtnAlign : "left",
           messageStoreMode: setting.messageStoreMode || "memory"
         });
       } catch (error) {
@@ -59837,12 +60354,14 @@ var require_settingController = __commonJS({
       try {
         const raw = typeof req.body?.notice === "string" ? req.body.notice : "";
         const okLabel = typeof req.body?.okLabel === "string" ? req.body.okLabel.trim().slice(0, Setting_1.SETTING_LIMITS.fsNoticeOkLabel) : "";
+        const btnAlign = req.body?.btnAlign === "center" || req.body?.btnAlign === "right" ? req.body.btnAlign : "left";
         if (raw.length > Setting_1.SETTING_LIMITS.fsNotice)
           return res.status(400).json({ errorMessage: "client_error.too_large_error" });
         const repository = (0, config_1.getSettingRepository)();
         const setting = await getSetting();
         setting.fsNotice = raw;
         setting.fsNoticeOkLabel = okLabel;
+        setting.fsNoticeBtnAlign = btnAlign;
         setting.fsNoticeUpdatedAt = (/* @__PURE__ */ new Date()).toISOString();
         if (req.body?.messageStoreMode === "memory" || req.body?.messageStoreMode === "gist") {
           const mode = req.body.messageStoreMode;
@@ -59914,7 +60433,7 @@ var require_settingController = __commonJS({
     };
     exports2.canWeChat = canWeChat;
     var deleteChat = async (req, res) => {
-      if (!req.session?.userInfo?.isAdmin)
+      if (!(0, permissions_1.canDeleteAllChat)(await getSetting(), req.session?.userInfo))
         return res.sendStatus(403);
       log.debug("Deleting all messages...");
       try {
@@ -60025,6 +60544,51 @@ var require_socketEvents = __commonJS({
   }
 });
 
+// server/src/models/Message.js
+var require_Message = __commonJS({
+  "server/src/models/Message.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.Message = void 0;
+    var BaseModel_1 = require_BaseModel();
+    var User_1 = require_User();
+    var ReplyTo = class {
+      id;
+      username;
+      text;
+      constructor(json) {
+        this.id = json.id;
+        this.text = typeof json.text === "string" ? json.text.substr(0, 50) : "";
+        this.username = json.username;
+      }
+    };
+    var Message = class extends BaseModel_1.BaseModel {
+      text;
+      username;
+      time;
+      replyTo;
+      edited_at;
+      role = User_1.RoleEnum.NON_ADMIN;
+      reactions;
+      /** attached media (voice/photo) — { mediaId, mime, seconds? }; the payload
+          itself lives in the media store, never inside the message */
+      media;
+      constructor(json = {}) {
+        super(json);
+        this.text = json.text || "";
+        this.username = json.username || "";
+        this.time = json.time || "";
+        this.replyTo = json.replyTo ? new ReplyTo(json.replyTo) : null;
+        this.reactions = json.reactions || {};
+        const m = json.media;
+        const MIME_OK = /^image\/(png|jpeg|webp|gif)$|^audio\/(webm|ogg|mp4|mpeg)$/;
+        this.media = m && typeof m === "object" && typeof m.mediaId === "string" && /^m[0-9a-z]+$/.test(m.mediaId) && typeof m.mime === "string" && m.mime.length <= 40 && MIME_OK.test(m.mime) ? { mediaId: m.mediaId, mime: m.mime, seconds: Number.isFinite(m.seconds) ? Math.round(m.seconds) : void 0 } : null;
+      }
+    };
+    exports2.Message = Message;
+  }
+});
+
 // server/src/socket/chatHandler.js
 var require_chatHandler = __commonJS({
   "server/src/socket/chatHandler.js"(exports2) {
@@ -60045,7 +60609,9 @@ var require_chatHandler = __commonJS({
     var ClientError_1 = require_ClientError();
     var SocketEvents_1 = require_socketEvents();
     var User_1 = require_User();
+    var Message_1 = require_Message();
     var htmlSanitizer_1 = require_htmlSanitizer();
+    var permissions_1 = require_permissions();
     var log = (0, logger_1.default)(__filename);
     function safeCallback(callback, payload) {
       if (typeof callback === "function")
@@ -60054,26 +60620,32 @@ var require_chatHandler = __commonJS({
     async function handleChatMessage(message, callback, socket) {
       log.debug(`Received chat message: ${JSON.stringify(message)}`);
       try {
-        if (!message?.text?.trim()) {
+        const normalized = new Message_1.Message(message);
+        const hasMedia = !!(normalized.media && normalized.media.mediaId);
+        message.media = normalized.media;
+        if (!message?.text?.trim() && !hasMedia) {
           safeCallback(callback, ClientError_1.ClientError.invalidError());
           return;
         }
-        if (message.text.length > htmlSanitizer_1.MAX_MESSAGE_CHARS) {
+        if (message.text && message.text.length > htmlSanitizer_1.MAX_MESSAGE_CHARS) {
           safeCallback(callback, ClientError_1.ClientError.tooLargeError());
           return;
         }
         const repository = (0, config_1.getMessageRepository)();
         message.username = socket.request.session.userInfo.username;
         message.role = socket.request.session.userInfo.isAdmin ? User_1.RoleEnum.ADMIN : User_1.RoleEnum.NON_ADMIN;
-        message.text = (0, htmlSanitizer_1.sanitizeMessageHtml)(message.text);
-        if (!message.text.trim()) {
+        normalized.text = message.text ? (0, htmlSanitizer_1.sanitizeMessageHtml)(message.text) : "";
+        normalized.username = message.username;
+        normalized.role = message.role;
+        normalized.time = message.time;
+        if ((!normalized.text || !normalized.text.trim()) && !hasMedia) {
           safeCallback(callback, ClientError_1.ClientError.invalidError());
           return;
         }
-        message.time = (/* @__PURE__ */ new Date()).toISOString();
-        const result = await repository.add(message);
+        normalized.time = (/* @__PURE__ */ new Date()).toISOString();
+        const result = await repository.add(normalized);
         safeCallback(callback, result);
-        socket.broadcast.emit(SocketEvents_1.socketEvents.chatMessage, message);
+        socket.broadcast.emit(SocketEvents_1.socketEvents.chatMessage, result);
       } catch (err) {
         log.error(err);
         safeCallback(callback, ClientError_1.ClientError.internalError());
@@ -60153,7 +60725,9 @@ var require_chatHandler = __commonJS({
     async function handleDeleteChat(socket, callback) {
       log.debug(`Received delete chat request.`);
       try {
-        if (!socket.request.session.userInfo.isAdmin) {
+        const setting = await (0, config_1.getSettingRepository)().get();
+        const allowed = permissions_1.canDeleteAllChat(setting[0], socket.request.session.userInfo);
+        if (!allowed) {
           safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
           return;
         }
@@ -60178,6 +60752,14 @@ var require_chatHandler = __commonJS({
         if (!message) {
           safeCallback(callback, { status: false });
           return;
+        }
+        if (message.media && message.media.mediaId) {
+          try {
+            const mediaStore = require_mediaStore();
+            await mediaStore.removeMedia(message.media.mediaId);
+          } catch (err) {
+            log.error("media cleanup after delete failed:", err.message);
+          }
         }
         if (message.username != loggedInUser.username && !loggedInUser.isAdmin) {
           safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
@@ -60352,45 +60934,6 @@ var require_userHandler = __commonJS({
   }
 });
 
-// server/src/models/Message.js
-var require_Message = __commonJS({
-  "server/src/models/Message.js"(exports2) {
-    "use strict";
-    Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.Message = void 0;
-    var BaseModel_1 = require_BaseModel();
-    var User_1 = require_User();
-    var ReplyTo = class {
-      id;
-      username;
-      text;
-      constructor(json) {
-        this.id = json.id;
-        this.text = typeof json.text === "string" ? json.text.substr(0, 50) : "";
-        this.username = json.username;
-      }
-    };
-    var Message = class extends BaseModel_1.BaseModel {
-      text;
-      username;
-      time;
-      replyTo;
-      edited_at;
-      role = User_1.RoleEnum.NON_ADMIN;
-      reactions;
-      constructor(json = {}) {
-        super(json);
-        this.text = json.text || "";
-        this.username = json.username || "";
-        this.time = json.time || "";
-        this.replyTo = json.replyTo ? new ReplyTo(json.replyTo) : null;
-        this.reactions = json.reactions || {};
-      }
-    };
-    exports2.Message = Message;
-  }
-});
-
 // server/src/socket/socketService.js
 var require_socketService = __commonJS({
   "server/src/socket/socketService.js"(exports2) {
@@ -60458,7 +61001,7 @@ var require_chatController = __commonJS({
       return mod && mod.__esModule ? mod : { "default": mod };
     };
     Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.exportChat = exports2.reactMessage = exports2.getMissingMessages = exports2.getMessages = void 0;
+    exports2.sendMessage = exports2.getMedia = exports2.uploadMedia = exports2.exportChat = exports2.reactMessage = exports2.getMissingMessages = exports2.getMessages = void 0;
     var socketService_1 = require_socketService();
     var SocketEvents_1 = require_socketEvents();
     var socketEvents_1 = require_socketEvents();
@@ -60467,6 +61010,9 @@ var require_chatController = __commonJS({
     var config_1 = require_repositoryFactory();
     var chatService_1 = require_chatService();
     var permissions_1 = require_permissions();
+    var Message_1 = require_Message();
+    var User_1 = require_User();
+    var htmlSanitizer_1 = require_htmlSanitizer();
     var log = (0, logger_1.default)(__filename);
     var clampLimit = (value) => {
       const n = parseInt(String(value ?? ""), 10);
@@ -60601,6 +61147,78 @@ var require_chatController = __commonJS({
         res.sendStatus(500);
       }
     };
+    var mediaStore_1 = require_mediaStore();
+    var uploadMedia = async (req, res) => {
+      try {
+        const user = req.session?.userInfo;
+        if (!user?.username)
+          return res.sendStatus(401);
+        const settings = await (0, config_1.getSettingRepository)().get();
+        if (!permissions_1.canUseMedia(settings[0], user))
+          return res.status(403).json({ message: "client_error.access_denied" });
+        const { mime, data } = req.body || {};
+        const out = await mediaStore_1.putMedia({ mime, data });
+        res.status(200).json(out);
+      } catch (error) {
+        if (/unsupported media type|empty media|too large/.test(String(error?.message)))
+          return res.status(400).json({ message: error.message });
+        log.error(error);
+        res.sendStatus(500);
+      }
+    };
+    exports2.uploadMedia = uploadMedia;
+    var getMedia = async (req, res) => {
+      try {
+        if (!req.session?.userInfo?.username)
+          return res.sendStatus(401);
+        const media = await mediaStore_1.getMedia(String(req.params.id || ""));
+        if (!media)
+          return res.sendStatus(404);
+        const buf = Buffer.from(media.data, "base64");
+        res.setHeader("Content-Type", media.mime);
+        res.setHeader("Content-Length", String(buf.length));
+        res.setHeader("Cache-Control", "private, max-age=86400");
+        res.status(200).end(buf);
+      } catch (error) {
+        log.error(error);
+        res.sendStatus(500);
+      }
+    };
+    exports2.getMedia = getMedia;
+    var sendMessage = async (req, res) => {
+      try {
+        const user = req.session?.userInfo;
+        if (!user?.username)
+          return res.sendStatus(401);
+        const raw = req.body || {};
+        const normalized = new Message_1.Message(raw);
+        const hasMedia = !!(normalized.media && normalized.media.mediaId);
+        const rawText = typeof raw?.text === "string" ? raw.text : "";
+        if (!rawText.trim() && !hasMedia)
+          throw ClientError_1.ClientError.invalidError();
+        if (rawText.length > htmlSanitizer_1.MAX_MESSAGE_CHARS)
+          throw ClientError_1.ClientError.tooLargeError();
+        const repository = (0, config_1.getMessageRepository)();
+        const message = {
+          text: rawText ? (0, htmlSanitizer_1.sanitizeMessageHtml)(rawText) : "",
+          username: user.username,
+          role: user.isAdmin ? User_1.RoleEnum.ADMIN : User_1.RoleEnum.NON_ADMIN,
+          replyTo: normalized.replyTo || null,
+          media: normalized.media || void 0,
+          time: (/* @__PURE__ */ new Date()).toISOString()
+        };
+        if ((!message.text || !message.text.trim()) && !hasMedia)
+          throw ClientError_1.ClientError.invalidError();
+        const result = await repository.add(message);
+        res.status(200).json(result);
+        const io = (0, socketService_1.getLiveIo)();
+        if (io)
+          io.emit(SocketEvents_1.socketEvents.chatMessage, result);
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.sendMessage = sendMessage;
   }
 });
 
@@ -60659,7 +61277,10 @@ var require_apiRouter = __commonJS({
     router.put("/chat/saveFrequentSymbols", SettingController_1.saveFrequentSymbols);
     router.post("/chat/getMessages", ChatController_1.getMessages);
     router.post("/chat/getMissingMessages", ChatController_1.getMissingMessages);
+    router.post("/chat", ChatController_1.sendMessage);
     router.post("/chat/react", ChatController_1.reactMessage);
+    router.post("/chat/media", ChatController_1.uploadMedia);
+    router.get("/chat/media/:id", ChatController_1.getMedia);
     router.put("/chat/updateNotice", SettingController_1.updateNotice);
     router.get("/chat/getFsNotice", SettingController_1.getFsNotice);
     router.put("/chat/updateFsNotice", SettingController_1.updateFsNotice);
@@ -62265,9 +62886,9 @@ var require_memorystore2 = __commonJS({
 var require_linksService = __commonJS({
   "server/src/services/linksService.js"(exports2) {
     "use strict";
-    Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.validateNotePut = exports2.notepadPage = exports2.linksPage = exports2.SETTINGS_HEADERS = void 0;
     var SETTING_LIMITS_REF = require_Setting();
+    var NoteService_1 = require_noteService();
+    var { SEPARATOR } = NoteService_1;
     var SETTINGS_HEADERS = {
       "Content-Type": "text/html; charset=utf-8",
       "X-Content-Type-Options": "nosniff",
@@ -62275,12 +62896,13 @@ var require_linksService = __commonJS({
       "X-Frame-Options": "SAMEORIGIN"
     };
     exports2.SETTINGS_HEADERS = SETTINGS_HEADERS;
-    var validateNotePut = (value) => {
-      if (typeof value !== "string") return "";
-      if (value.length > SETTING_LIMITS_REF.SETTING_LIMITS.attendanceNote) return null;
-      return value;
-    };
-    exports2.validateNotePut = validateNotePut;
+    var deniedBody = () => `<!doctype html>
+<html lang="bn"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>\u09AA\u09CD\u09B0\u09AC\u09C7\u09B6\u09BE\u09A7\u09BF\u0995\u09BE\u09B0 \u09A8\u09C7\u0987</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:"Noto Sans Bengali",system-ui,sans-serif;background:#f6f7f9;color:#1b1f24;padding:24px;text-align:center}h1{font-size:18px;margin:0 0 6px}p{margin:0;color:#5b6572;font-size:14px}@media (prefers-color-scheme: dark){body{background:#12161b;color:#e8edf3}p{color:#9aa5b1}}</style>
+</head><body><div><h1>\u09AA\u09CD\u09B0\u09AC\u09C7\u09B6\u09BE\u09A7\u09BF\u0995\u09BE\u09B0 \u09A8\u09C7\u0987</h1><p>\u098F\u0987 \u09AA\u09C7\u099C\u099F\u09BE \u09B6\u09C1\u09A7\u09C1 \u0985\u09A8\u09C1\u09AE\u09A4\u09BF-\u09AA\u09CD\u09B0\u09BE\u09AA\u09CD\u09A4 \u0987\u0989\u099C\u09BE\u09B0\u09C7\u09B0 \u099C\u09A8\u09CD\u09AF\u0964</p></div></body></html>`;
+    exports2.deniedBody = deniedBody;
     var linksPage = () => ({
       status: 200,
       headers: SETTINGS_HEADERS,
@@ -62297,7 +62919,7 @@ var require_linksService = __commonJS({
   h1 { font-size: 20px; margin: 0 0 18px; }
   a.item { display: flex; align-items: center; gap: 10px; padding: 16px 18px; margin-bottom: 12px;
            background: #fff; border: 1px solid #e3e8ee; border-radius: 12px; text-decoration: none;
-           color: inherit; font-size: 16px; font-weight: 600; }
+           color: inherit; font-size: 16px; weight: 600; }
   a.item:hover { border-color: #2563eb; }
   a.item .ic { font-size: 20px; }
   a.item .sub { display: block; font-size: 12.5px; font-weight: 400; color: #5b6572; margin-top: 2px; }
@@ -62310,15 +62932,19 @@ var require_linksService = __commonJS({
 <body>
   <h1>\u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u0993 \u09A8\u09CB\u099F</h1>
   <a class="item" href="/attendance" target="_blank" rel="noopener"><span class="ic">\u{1F4CB}</span><span>\u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u0995\u09BE\u0989\u09A8\u09CD\u099F\u09BE\u09B0<span class="sub">\u09B9\u09BE\u099C\u09BF\u09B0\u09BE \u09A6\u09C7\u0993\u09AF\u09BC\u09BE\u09B0 \u09AA\u09C7\u099C</span></span></a>
-  <a class="item" href="/notepad" target="_blank" rel="noopener"><span class="ic">\u{1F4DD}</span><span>\u09A8\u09CB\u099F\u09AA\u09CD\u09AF\u09BE\u09A1<span class="sub">\u09B6\u09C7\u09AF\u09BC\u09BE\u09B0\u09CD\u09A1 \u09A8\u09CB\u099F \u2014 \u09B2\u09BF\u0996\u09C1\u09A8 \u0993 \u09B8\u09C7\u09AD \u0995\u09B0\u09C1\u09A8</span></span></a>
+  <a class="item" href="/notepad" target="_blank" rel="noopener"><span class="ic">\u{1F4DD}</span><span>\u09A8\u09CB\u099F\u09AA\u09CD\u09AF\u09BE\u09A1<span class="sub">\u09B6\u09C7\u09AF\u09BC\u09BE\u09B0\u09CD\u09A1 \u09A8\u09CB\u099F \u2014 \u099F\u09CD\u09AF\u09BE\u09AC\u09B8\u09B9, \u0986\u09A8\u09B2\u09BF\u09AE\u09BF\u099F\u09C7\u09A1</span></span></a>
 </body>
 </html>`
     });
     exports2.linksPage = linksPage;
-    var notepadPage = (initialNote) => ({
-      status: 200,
-      headers: SETTINGS_HEADERS,
-      body: `<!doctype html>
+    var notepadPage = function(initialNote, tabCount) {
+      const _legacy = typeof initialNote === "string" ? initialNote : "";
+      const _tabs = Math.max(typeof tabCount === "number" ? tabCount : 1, 1);
+      const SEPARATOR_JSON = JSON.stringify(NoteService_1.SEPARATOR);
+      return {
+        status: 200,
+        headers: SETTINGS_HEADERS,
+        body: `<!doctype html>
 <html lang="bn">
 <head>
 <meta charset="utf-8" />
@@ -62326,59 +62952,234 @@ var require_linksService = __commonJS({
 <title>\u09A8\u09CB\u099F\u09AA\u09CD\u09AF\u09BE\u09A1</title>
 <style>
   :root { color-scheme: light dark; }
-  body { margin: 0; padding: 24px 16px; font-family: "Noto Sans Bengali", "Hind Siliguri", system-ui, sans-serif;
+  body { margin: 0; padding: 20px 16px 28px; font-family: "Noto Sans Bengali", "Hind Siliguri", system-ui, sans-serif;
          background: #f6f7f9; color: #1b1f24; }
-  h1 { font-size: 20px; margin: 0 0 14px; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .tab { display: inline-flex; align-items: center; gap: 8px; max-width: 240px; padding: 7px 12px;
+         font: inherit; font-size: 13.5px; border: 1px solid #c9d1da; border-radius: 8px 8px 0 0;
+         background: #eceff3; color: inherit; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; }
+  .tab.dragging { opacity: .55; box-shadow: 0 6px 18px rgba(0,0,0,.25); }
+  .tab.drop-before { box-shadow: -3px 0 0 0 #2563eb; }
+  .tab.drop-after { box-shadow: 3px 0 0 0 #2563eb; }
+  .tab.active { background: #fff; border-color: #2563eb; border-bottom-color: #fff; font-weight: 600; }
+  .tab .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tab .x { border: 0; background: none; color: #5b6572; cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1; }
+  .tab .x:hover { color: #c62828; }
+  #addtab { padding: 7px 14px; font: inherit; font-size: 14px; border: 1px dashed #9aa5b1; border-radius: 8px;
+            background: none; color: inherit; cursor: pointer; }
+  #addtab:hover { border-color: #2563eb; color: #2563eb; }
   textarea { width: 100%; min-height: 55vh; font: 15px/1.6 inherit; padding: 14px;
              border-radius: 10px; border: 1px solid #c9d1da; background: #fff; color: inherit;
-             box-sizing: border-box; resize: vertical; }
-  .bar { display: flex; gap: 12px; align-items: center; margin-top: 12px; }
-  button { font: inherit; padding: 10px 18px; border-radius: 8px; border: 1px solid #2563eb;
+             box-sizing: border-box; resize: vertical; white-space: pre; }
+  .bar { display: flex; gap: 12px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  button.save { font: inherit; padding: 10px 18px; border-radius: 8px; border: 1px solid #2563eb;
            background: #2563eb; color: #fff; cursor: pointer; }
-  button:disabled { opacity: .6; cursor: default; }
+  button.save:disabled { opacity: .6; cursor: default; }
   #msg { font-size: 13px; color: #5b6572; }
+  #chars { font-size: 12.5px; color: #5b6572; }
   a.back { color: #2563eb; text-decoration: none; font-size: 14px; }
   @media (prefers-color-scheme: dark) {
     body { background: #12161b; color: #e8edf3; }
     textarea { background: #1b2128; border-color: #2b333d; }
+    .tab { background: #1b2128; border-color: #2b333d; }
+    .tab.active { background: #232b34; border-color: #2563eb; }
   }
 </style>
 </head>
 <body>
   <h1>\u09A8\u09CB\u099F\u09AA\u09CD\u09AF\u09BE\u09A1</h1>
+  <div class="tabs" id="tabsbar"></div>
   <textarea id="note" spellcheck="false"></textarea>
   <div class="bar">
-    <button id="save">\u09B8\u09C7\u09AD \u0995\u09B0\u09C1\u09A8</button>
+    <button class="save" id="save">\u09B8\u09C7\u09AD \u0995\u09B0\u09C1\u09A8</button>
     <span id="msg"></span>
+    <span id="chars"></span>
     <span style="flex:1"></span>
     <a class="back" href="/links">\u2190 \u09A4\u09BE\u09B2\u09BF\u0995\u09BE\u09AF\u09BC \u09AB\u09BF\u09B0\u09C1\u09A8</a>
   </div>
 <script>
     (function () {
+      var SEP = ${SEPARATOR_JSON};
       var box = document.getElementById("note");
+      var bar = document.getElementById("tabsbar");
       var msg = document.getElementById("msg");
+      var chars = document.getElementById("chars");
       var save = document.getElementById("save");
-      box.value = ${JSON.stringify(typeof initialNote === "string" ? initialNote.slice(0, SETTING_LIMITS_REF.SETTING_LIMITS.attendanceNote) : "")};
-      save.onclick = function () {
+      var tabs = [];                      // [{content}] \u2014 protectedtext \u09AE\u09A1\u09C7\u09B2; \u09B8\u09BE\u09B0\u09CD\u09AD \u0995\u09B0\u09BE\u09B0 \u09B8\u09AE\u09AF\u09BC \u09AD\u09B0\u09BE \u09B9\u09AF\u09BC
+      var active = 0;
+      var savedText = "";                 // \u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0\u09C7 \u09A5\u09BE\u0995\u09BE \u099C\u09CB\u09A1\u09BC\u09BE-\u099F\u09C7\u0995\u09CD\u09B8\u099F; \u09B2\u09CB\u09A1-\u09AB\u09C7\u099A \u09B8\u09AB\u09B2 \u09B9\u09B2\u09C7 \u09B8\u09C7\u099F \u09B9\u09AF\u09BC
+      function titleFrom(c) {
+        var t = (c || "").replace(/\\r/g, "");
+        var nl = t.indexOf("\\n");
+        var line = (nl === -1 ? t : t.slice(0, nl)).trim();
+        return line ? line.slice(0, 40) : "\u09AB\u09BE\u0981\u0995\u09BE \u099F\u09CD\u09AF\u09BE\u09AC";
+      }
+      function render() {
+        bar.innerHTML = "";
+        tabs.forEach(function (tb, i) {
+          var el = document.createElement("div");
+          el.className = "tab" + (i === active ? " active" : "");
+          var t = document.createElement("span"); t.className = "t"; t.textContent = titleFrom(tb.content);
+          var x = document.createElement("button"); x.className = "x"; x.type = "button"; x.textContent = "\u2715"; x.title = "\u099F\u09CD\u09AF\u09BE\u09AC \u09AC\u09A8\u09CD\u09A7 \u0995\u09B0\u09C1\u09A8"; x.style.touchAction = "none";
+          x.onclick = function (e) { e.stopPropagation(); closeTab(i); };
+          el.appendChild(t); el.appendChild(x);
+          el.onclick = function () { if (Date.now() - lastDragEnd < 400) return; if (i !== active) { commitActive(); active = i; render(); focusBox(); } };
+          bar.appendChild(el);
+        });
+        var add = document.createElement("button");
+        add.id = "addtab"; add.type = "button"; add.textContent = "+ \u09A8\u09A4\u09C1\u09A8 \u099F\u09CD\u09AF\u09BE\u09AC";
+        add.onclick = addTab;
+        bar.appendChild(add);
+        box.value = tabs[active] ? tabs[active].content : "";
+        updateChars();
+      }
+      function commitActive() {
+        if (tabs[active]) tabs[active].content = box.value;
+        if (tabs[active]) tabs[active].title = titleFrom(tabs[active].content);
+      }
+      function addTab() { commitActive(); tabs.push({ title: "\u09AB\u09BE\u0981\u0995\u09BE \u099F\u09CD\u09AF\u09BE\u09AC", content: "" }); active = tabs.length - 1; render(); focusBox(); }
+      // ---- tab re-ordering (swap by drag) \u2014 protectedtext.com-style (MIT):
+      // their jQuery-UI sortable uses {distance:5, tolerance:"pointer"}; this is
+      // the pointer-events twin: press \u2192 move \u22655px = drag (else click), drop
+      // inserts the dragged tab at the hovered tab's edge. Mobile touch works
+      // via pointer events; reordering marks the note modified (unsaved warning).
+      var drag = null; // {from, startX, started}
+      var lastDragEnd = 0; // a real drag must not end as an accidental tab-switch click
+      function clearDropMarks() {
+        for (var i = 0; i < bar.children.length; i++) {
+          var ch = bar.children[i];
+          if (ch.classList) ch.classList.remove("drop-before", "drop-after");
+        }
+      }
+      function dragTargetFromPoint(x, y) {
+        var els = document.elementsFromPoint ? document.elementsFromPoint(x, y) : [];
+        for (var i = 0; i < els.length; i++) {
+          var el = els[i];
+          if (el && el.classList && el.classList.contains("tab") && bar.contains(el)) return el;
+        }
+        return null;
+      }
+      bar.addEventListener("pointerdown", function (e) {
+        if (e.button !== 0) return;
+        // the \u2715 close-button is NOT a drag handle \u2014 starting a drag here (and
+        // capturing the pointer on the tab) would retarget the click to the
+        // tab element, so closeTab() never fired (user report 2026-11-07)
+        if (e.target.closest && e.target.closest(".x")) return;
+        var el = e.target.closest ? e.target.closest(".tab") : null;
+        if (!el || !bar.contains(el)) return;
+        drag = { el: el, from: [].indexOf.call(bar.children, el), startX: e.clientX, started: false };
+        try { el.setPointerCapture(e.pointerId); } catch (err) { /* older engines */ }
+      });
+      bar.addEventListener("pointermove", function (e) {
+        if (!drag) return;
+        if (!drag.started) {
+          if (Math.abs(e.clientX - drag.startX) < 5) return;
+          drag.started = true;
+          drag.el.classList.add("dragging");
+        }
+        e.preventDefault();
+        clearDropMarks();
+        var over = dragTargetFromPoint(e.clientX, e.clientY);
+        if (over && over !== drag.el) {
+          var r = over.getBoundingClientRect();
+          over.classList.add(e.clientX < r.left + r.width / 2 ? "drop-before" : "drop-after");
+        }
+      }, { passive: false });
+      bar.addEventListener("pointerup", function (e) {
+        if (!drag) return;
+        var d = drag; drag = null;
+        try { d.el.releasePointerCapture(e.pointerId); } catch (err) { /* noop */ }
+        if (!d.started) return; // plain click \u2014 tab switch handler runs as usual
+        d.el.classList.remove("dragging");
+        clearDropMarks();
+        var over = dragTargetFromPoint(e.clientX, e.clientY);
+        if (!over || over === d.el) return;
+        var to = [].indexOf.call(bar.children, over);
+        var r = over.getBoundingClientRect();
+        var after = e.clientX > r.left + r.width / 2;
+        // sortable arithmetic: DOM index \u2192 post-removal insert index
+        if (d.from < to) { if (!after) to -= 1; }
+        else if (after) to += 1;
+        if (d.from === to) return;
+        commitActive();
+        var moved = tabs.splice(d.from, 1)[0];
+        tabs.splice(to, 0, moved);
+        if (active === d.from) active = to; else if (d.from < active && active <= to) active -= 1; else if (to <= active && active < d.from) active += 1;
+        lastDragEnd = Date.now();
+        render(); focusBox();
+      });
+      bar.addEventListener("pointercancel", function () {
+        if (!drag) return;
+        drag.el.classList.remove("dragging");
+        clearDropMarks();
+        drag = null;
+      });
+      function closeTab(i) {
+        if (tabs.length === 1) { tabs = [{ title: "\u09AB\u09BE\u0981\u0995\u09BE \u099F\u09CD\u09AF\u09BE\u09AC", content: "" }]; active = 0; render(); focusBox(); return; }
+        tabs.splice(i, 1); if (active >= tabs.length) active = tabs.length - 1; render(); focusBox();
+      }
+      function focusBox() { try { box.focus(); } catch (e) {} }
+      function updateChars() { chars.textContent = totalChars() + " \u0985\u0995\u09CD\u09B7\u09B0"; }
+      function joined() { commitActive(); return tabs.map(function (tb) { return tb.content; }).join(SEP); }
+      function totalChars() { return tabs.reduce(function (n, tb) { return n + (tb.content ? tb.content.length : 0); }, 0); }
+      box.addEventListener("input", function () {
+        if (tabs[active]) { tabs[active].content = box.value; tabs[active].title = titleFrom(box.value); }
+        updateChars();
+        var t = titleFrom(box.value);
+        var el = bar.children[active];
+        if (el && el.firstElementChild) el.firstElementChild.textContent = t;
+      });
+      // Tab key \u2192 4 spaces (protectedtext pattern)
+      box.addEventListener("keydown", function (e) {
+        if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+          e.preventDefault();
+          var s = box.selectionStart, en = box.selectionEnd;
+          box.value = box.value.substring(0, s) + "    " + box.value.substring(en);
+          box.selectionStart = box.selectionEnd = s + 4;
+          box.dispatchEvent(new Event("input"));
+        }
+        if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S")) { e.preventDefault(); doSave(); }
+      });
+      function doSave() {
+        commitActive();
         save.disabled = true;
         msg.textContent = "\u09B8\u09C7\u09AD \u09B9\u099A\u09CD\u099B\u09C7\u2026";
         fetch("/api/chat/attendance-note", {
           method: "PUT",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ note: box.value })
+          body: JSON.stringify({ note: joined() })
         }).then(function (r) {
-          if (r.ok) { msg.textContent = "\u09B8\u09C7\u09AD \u09B9\u09AF\u09BC\u09C7\u099B\u09C7"; setTimeout(function () { msg.textContent = ""; }, 2000); }
+          if (r.ok) { savedText = joined(); msg.textContent = "\u09B8\u09C7\u09AD \u09B9\u09AF\u09BC\u09C7\u099B\u09C7"; setTimeout(function () { msg.textContent = ""; }, 2000); }
+          else if (r.status === 413) { msg.textContent = "\u0996\u09C1\u09AC \u09AC\u09A1\u09BC \u2014 \u098F\u0995\u09AC\u09BE\u09B0\u09C7 \u098F\u09A4 \u09AC\u09A1\u09BC \u09A8\u09CB\u099F \u09B8\u09C7\u09AD \u0995\u09B0\u09BE \u09AF\u09BE\u09AF\u09BC \u09A8\u09BE"; }
           else { msg.textContent = "\u09B8\u09C7\u09AD \u09B9\u09AF\u09BC\u09A8\u09BF \u2014 \u0986\u09AC\u09BE\u09B0 \u099A\u09C7\u09B7\u09CD\u099F\u09BE \u0995\u09B0\u09C1\u09A8"; }
-        }).catch(function () { msg.textContent = "\u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0\u09C7 \u09AA\u09CC\u0981\u099B\u09BE\u09A8\u09CB \u09AF\u09BE\u099A\u09CD\u099B\u09C7 \u09A8\u09BE"; })
-        .finally ? null : null;
+        }).catch(function () { msg.textContent = "\u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0\u09C7 \u09AA\u09CC\u0981\u099B\u09BE\u09A8\u09CB \u09AF\u09BE\u099A\u09CD\u099B\u09C7 \u09A8\u09BE"; });
         save.disabled = false;
-      };
+      }
+      save.onclick = doSave;
+      window.addEventListener("beforeunload", function (e) {
+        if (joined() !== savedText) { e.preventDefault(); e.returnValue = ""; }
+      });
+      render(); focusBox();
+      // \u09B2\u09CB\u09A1: \u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0-\u09B8\u09CD\u099F\u09CB\u09B0 \u09A5\u09C7\u0995\u09C7 \u09A8\u09CB\u099F \u0986\u09A8\u09C1\u09A8 (\u0986\u09A8\u09B2\u09BF\u09AE\u09BF\u099F\u09C7\u09A1 \u2014 \u09A4\u09BE\u0987 \u09AA\u09C7\u099C\u09C7 \u0987\u09A8\u099C\u09C7\u0995\u09CD\u099F \u09A8\u09AF\u09BC)
+      fetch("/api/chat/attendance-note", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (data) {
+          if (!data) { msg.textContent = "\u09A8\u09CB\u099F \u09B2\u09CB\u09A1 \u09B9\u09AF\u09BC\u09A8\u09BF \u2014 \u09B8\u09C7\u09AD \u0995\u09B0\u09BE\u09B0 \u0986\u0997\u09C7 \u09B0\u09BF\u09AB\u09CD\u09B0\u09C7\u09B6 \u0995\u09B0\u09C1\u09A8"; return; }
+          var parts = (typeof data.note === "string" && data.note) ? data.note.split(SEP) : [""];
+          tabs = parts.map(function (p) { return { content: p }; });
+          savedText = data.note || "";
+          active = 0;
+          render(); focusBox();
+        })
+        .catch(function () { msg.textContent = "\u09A8\u09CB\u099F \u09B2\u09CB\u09A1 \u09B9\u09AF\u09BC\u09A8\u09BF \u2014 \u09B8\u0982\u09AF\u09CB\u0997 \u09A6\u09C7\u0996\u09C1\u09A8"; });
     })();
   </script>
 </body>
 </html>`
-    });
+      };
+    };
     exports2.notepadPage = notepadPage;
   }
 });
@@ -62440,8 +63241,12 @@ var require_initData = __commonJS({
       }
     };
     async function initializeSettingAndUser() {
-      await initializeSetting();
-      await insertDummyAdminUser();
+      try {
+        await initializeSetting();
+        await insertDummyAdminUser();
+      } catch (err) {
+        log.error("boot storage init failed (server stays up; reads/writes will retry):", err.message);
+      }
       try {
         const settings = await config_1.getSettingRepository().get();
         const mode = settings[0]?.messageStoreMode === "gist" ? "gist" : "memory";
@@ -62547,8 +63352,9 @@ var require_app = __commonJS({
     });
     exports2.sessionMiddleware = sessionMiddleware;
     app.use(sessionMiddleware);
-    app.use(express_1.default.json({ limit: "1mb" }));
-    app.use(express_1.default.urlencoded({ extended: false }));
+    var NOTE_JSON_LIMIT = process.env.NOTE_JSON_LIMIT || "20mb";
+    app.use(express_1.default.json({ limit: NOTE_JSON_LIMIT }));
+    app.use(express_1.default.urlencoded({ extended: false, limit: NOTE_JSON_LIMIT }));
     app.use(express_1.default.static(paths_1.PROJECT_ROOT && path_1.default.join(paths_1.PROJECT_ROOT, "public"), {
       etag: true,
       lastModified: true,
@@ -62616,7 +63422,7 @@ var require_app = __commonJS({
         const page2 = (0, attendanceService_1.attendanceDeniedPage)();
         return res.status(page2.status).set(page2.headers).send(page2.body);
       }
-      const page = linksService_1.notepadPage(setting.attendanceNote);
+      const page = linksService_1.notepadPage();
       res.status(page.status).set(page.headers).send(page.body);
     };
     exports2.__bcaNotepadHandler = notepadHandler;
@@ -75324,6 +76130,62 @@ var require_dist3 = __commonJS({
   }
 });
 
+// server/src/services/mediaCleanup.js
+var require_mediaCleanup = __commonJS({
+  "server/src/services/mediaCleanup.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.MEDIA_RETENTION_DAYS = exports2.MEDIA_CLEANUP_INTERVAL_H = void 0;
+    exports2.collectReferencedMediaIds = collectReferencedMediaIds;
+    exports2.runMediaCleanup = runMediaCleanup;
+    exports2.startMediaCleanupLoop = startMediaCleanupLoop;
+    var logger_1 = require_logger2();
+    var config_1 = require_repositoryFactory();
+    var mediaStore_1 = require_mediaStore();
+    var log = (0, logger_1.default)(__filename);
+    var MEDIA_RETENTION_DAYS = Math.max(parseInt(process.env.MEDIA_RETENTION_DAYS || "30", 10), 1);
+    exports2.MEDIA_RETENTION_DAYS = MEDIA_RETENTION_DAYS;
+    var MEDIA_CLEANUP_INTERVAL_H = Math.max(parseInt(process.env.MEDIA_CLEANUP_INTERVAL_H || "24", 10), 1);
+    exports2.MEDIA_CLEANUP_INTERVAL_H = MEDIA_CLEANUP_INTERVAL_H;
+    async function collectReferencedMediaIds() {
+      const ids = /* @__PURE__ */ new Set();
+      try {
+        const items = await (0, config_1.getMessageRepository)().get();
+        for (const m of items) {
+          const id = m && m.media && m.media.mediaId;
+          if (typeof id === "string")
+            ids.add(id);
+        }
+      } catch (err) {
+        log.error("media cleanup: reading message history failed:", err.message);
+      }
+      return ids;
+    }
+    async function runMediaCleanup() {
+      const referenced = await collectReferencedMediaIds();
+      const cutoff = Date.now() - MEDIA_RETENTION_DAYS * 24 * 60 * 60 * 1e3;
+      const removed = await mediaStore_1.sweepUnreferenced(referenced, cutoff);
+      log.info(`media cleanup: removed ${removed.count}, kept referenced ${removed.keptRef}, kept fresh ${removed.keptFresh} (retention ${MEDIA_RETENTION_DAYS}d)`);
+      return removed.count;
+      log.info(`media cleanup: removed ${removed}, kept referenced ${keptRef}, kept fresh ${keptFresh} (retention ${MEDIA_RETENTION_DAYS}d)`);
+      return removed;
+    }
+    var started = false;
+    function startMediaCleanupLoop() {
+      if (started)
+        return;
+      started = true;
+      setTimeout(() => {
+        runMediaCleanup().catch((err) => log.error("media cleanup (boot) failed:", err.message));
+      }, 2 * 60 * 1e3);
+      setInterval(() => {
+        runMediaCleanup().catch((err) => log.error("media cleanup failed:", err.message));
+      }, MEDIA_CLEANUP_INTERVAL_H * 60 * 60 * 1e3);
+      log.info(`media auto-cleanup active: retention ${MEDIA_RETENTION_DAYS}d, every ${MEDIA_CLEANUP_INTERVAL_H}h`);
+    }
+  }
+});
+
 // server/src/www.js
 var require_www = __commonJS({
   "server/src/www.js"(exports2) {
@@ -75392,6 +76254,7 @@ var require_www = __commonJS({
     nodeServer.on("error", onError);
     nodeServer.on("listening", onListening);
     log.info("Server is listening on port  " + port);
+    require_mediaCleanup().startMediaCleanupLoop();
     function normalizePort(val) {
       const port2 = parseInt(val, 10);
       if (isNaN(port2)) {
@@ -75424,7 +76287,6 @@ var require_www = __commonJS({
       const addr = nodeServer.address();
       const bind = typeof addr === "string" ? "pipe " + addr : "port " + addr?.port;
       (0, debug_1.default)("Listening on " + bind);
-      console.log("Listening on " + bind);
     }
   }
 });

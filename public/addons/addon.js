@@ -95,6 +95,16 @@
       pickerOnlineTitle: "Users allowed to see the list",
       pickerAttendanceTitle: "Users allowed to open the attendance page",
       pickerPlaceholder: "username",
+      delChatLabel: "Who may delete the whole chat history?",
+      pickerDeleteTitle: "Users allowed to delete the history",
+      delMenuItem: "Delete entire chat history",
+      delConfirm: "Delete the ENTIRE chat history for everyone? This cannot be undone.",
+      delDone: "Chat history deleted",
+      delMenu: "Delete chat history",
+      menuMore: "Menu",
+      mediaModeLabel: "Who can send voice/photos (media)?",
+      pickerMediaTitle: "Users allowed to send media",
+      delCancel: "Cancel",
       noSelectedUsers: "Nobody selected yet",
       removeUser: "Remove",
       tabPermissions: "Permissions",
@@ -204,6 +214,16 @@
       pickerOnlineTitle: "তালিকা কারা দেখতে পারবে",
       pickerAttendanceTitle: "কাজিরা পেজ কারা খুলতে পারবে",
       pickerPlaceholder: "ইউজারনেম",
+      delChatLabel: "পুরো চ্যাট-হিস্টরি কারা মুছতে পারবে?",
+      pickerDeleteTitle: "হিস্টরি কারা মুছতে পারবে",
+      delMenuItem: "পুরো চ্যাট-হিস্টরি মুছুন",
+      delConfirm: "সবার জন্য পুরো চ্যাট-হিস্টরি মুছে ফেলবেন? এটা আর ফেরানো যাবে না।",
+      delDone: "চ্যাট-হিস্টরি মুছে ফেলা হয়েছে",
+      delMenu: "চ্যাট-হিস্টরি মুছুন",
+      menuMore: "মেনু",
+      mediaModeLabel: "ভয়েস/ছবি (মিডিয়া) কারা পাঠাতে পারবে?",
+      pickerMediaTitle: "মিডিয়া কারা পাঠাতে পারবে",
+      delCancel: "বাতিল",
       noSelectedUsers: "এখনো কাউকে বাছাই করা হয়নি",
       removeUser: "সরান",
       tabPermissions: "পারমিশন",
@@ -269,13 +289,11 @@
   }
 
   async function fetchMe() {
-    try {
-      const res = await fetch("/api/users/me", { credentials: "same-origin" });
-      if (!res.ok) return null;
-      return await res.json();
-    } catch {
-      return null;
-    }
+    // session state from the shared hub (ui-fixes.js owns the single
+    // /api/users/me poll — owner request: এক কল, সবাই শোনে)
+    const sess = window.__bcaSession;
+    if (sess?.loggedIn && sess.me) return sess.me;
+    return null;
   }
 
   // ---------- feature visibility (admin-configurable) ----------
@@ -311,6 +329,15 @@
       typeof body.canSeeOnlineUsers === "boolean" ? body.canSeeOnlineUsers : features.showOnlineUsers === "all";
     features.canViewAttendance =
       typeof body.canViewAttendance === "boolean" ? body.canViewAttendance : !!isAdmin;
+    // destructive feature — default stays admin-only on legacy servers
+    features.deleteChatMode = modeOf(body.deleteChatMode, "admin");
+    features.canDeleteAllChat =
+      typeof body.canDeleteAllChat === "boolean" ? body.canDeleteAllChat : !!isAdmin;
+    // media (voice/photo) — legacy servers without the field keep the
+    // historical everyone-can behavior; admins always can
+    features.mediaMode = modeOf(body.mediaMode, "all");
+    features.canUseMedia =
+      typeof body.canUseMedia === "boolean" ? body.canUseMedia : true;
     features.hasAttendanceHtml = body.hasAttendanceHtml === true;
     features.supported = true;
   }
@@ -501,6 +528,51 @@
     return parts.join("");
   }
 
+  // ---------- delete-history: ONE shared flow for every entry point ----------
+  // Owner report 2026-11-09: the delete option lived inside the copy popup,
+  // which never renders without copy permission — a delete-permitted user
+  // then had NO reachable path. Now both the copy popup's inline option and
+  // the standalone navbar button open this same confirm popup; the real
+  // guard stays server-side (deleteChatMode).
+  function showDeletePopup() {
+    closePopup();
+    const s = S();
+    const host = root();
+    const pop = document.createElement("div");
+    pop.className = "bca-popup bca-delpop";
+    pop.innerHTML = `
+      <button class="bca-close" type="button">✕</button>
+      <h3></h3>
+      <p class="bca-delwarn"></p>
+      <div class="bca-actions">
+        <button class="bca-btn bca-danger" data-act="del" type="button"></button>
+        <button class="bca-btn ghost" data-act="cancel" type="button"></button>
+      </div>`;
+    pop.querySelector("h3").textContent = s.delMenu;
+    pop.querySelector(".bca-delwarn").textContent = s.delConfirm;
+    const delBtn = pop.querySelector('[data-act="del"]');
+    delBtn.textContent = s.delMenuItem;
+    pop.querySelector('[data-act="cancel"]').textContent = s.delCancel;
+    pop.querySelector('[data-act="cancel"]').addEventListener("click", closePopup);
+    host.appendChild(pop);
+    watchPopup(pop, ".bca-fab, .bca-navcopy, .bca-navdel");
+    delBtn.addEventListener("click", async () => {
+      delBtn.disabled = true;
+      try {
+        const res = await fetch("/api/chat/delete", { method: "DELETE", credentials: "same-origin" });
+        if (res.ok) { closePopup(); toast(s.delDone); }
+        else {
+          const body = await res.json().catch(() => null);
+          toast(body && body.message ? errText(body) : S().genericErr, true);
+        }
+      } catch { toast(S().genericErr, true); }
+      finally { delBtn.disabled = false; }
+    });
+  }
+
+  /** the shared DELETE action used by every entry point */
+  async function deleteAllChat() { showDeletePopup(); }
+
   function showExportPopup() {
     closePopup();
     const s = S();
@@ -646,6 +718,17 @@
 
     buttons[0].addEventListener("click", copy);
     buttons[1].addEventListener("click", download);
+
+    // owner request 2026-11-08: those with delete-permission get the option
+    // right here — same popup, guarded server-side by deleteChatMode
+    if (loggedIn && features.supported && features.canDeleteAllChat) {
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "bca-btn bca-danger";
+      del.textContent = s.delMenuItem;
+      pop.querySelector(".bca-actions").appendChild(del);
+      del.addEventListener("click", () => { closePopup(); deleteAllChat(); });
+    }
   }
 
   // ==================================================================
@@ -976,6 +1059,36 @@
     );
     copyPicker.onChange(() => save({ copyAllSelected: copyPicker.values() }));
     onlinePicker.onChange(() => save({ onlineUsersSelected: onlinePicker.values() }));
+
+    // owner request 2026-11-08: who may delete the WHOLE chat history
+    const deleteMode = lists?.deleteChatMode || "admin";
+    const deletePicker = userPicker(s.pickerDeleteTitle, s.pickerPlaceholder, lists?.deleteChatSelected || []);
+    const deleteSeg = featureBlock(s.delChatLabel, "bca-delmode", deleteMode, deletePicker);
+    checkRadio(deleteSeg, deleteMode);
+    deleteSeg.querySelectorAll("input").forEach((input) =>
+      input.addEventListener("change", () =>
+        save({ deleteChatMode: input.value, deleteChatSelected: deletePicker.values() }, () =>
+          checkRadio(deleteSeg, features.deleteChatMode || "admin")
+        )
+      )
+    );
+    deletePicker.onChange(() => save({ deleteChatSelected: deletePicker.values() }));
+
+    // owner request 2026-11-09: media (voice/photo) on/off per feature —
+    // the deleteChat twin; admins always can, default "all" keeps the
+    // historical behavior on servers without these fields
+    const mediaMode = lists?.mediaMode || "all";
+    const mediaPicker = userPicker(s.pickerMediaTitle, s.pickerPlaceholder, lists?.mediaSelected || []);
+    const mediaSeg = featureBlock(s.mediaModeLabel, "bca-mediamode", mediaMode, mediaPicker);
+    checkRadio(mediaSeg, mediaMode);
+    mediaSeg.querySelectorAll("input").forEach((input) =>
+      input.addEventListener("change", () =>
+        save({ mediaMode: input.value, mediaSelected: mediaPicker.values() }, () =>
+          checkRadio(mediaSeg, features.mediaMode || "all")
+        )
+      )
+    );
+    mediaPicker.onChange(() => save({ mediaSelected: mediaPicker.values() }));
 
     // ---------- users tab: force-logout ----------
     usersPane.innerHTML = `
@@ -1806,18 +1919,27 @@
   // ---------- navbar icons (bootstrap-icons, matching the app's own) ----------
   const CLIPBOARD_SVG =
     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-clipboard" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zM9.5 0h-3a1.5 1.5 0 0 0-1.5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0z"/></svg>';
+  const MORE_SVG =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" class="bi bi-three-dots" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 9.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3m5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3m5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3"/></svg>';
+  const TRASH_SVG =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-trash" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0z"/><path d="M14.54 3.87 13.3 13a2 2 0 0 1-2 1.72H4.7a2 2 0 0 1-2-1.72L1.46 3.87A1 1 0 0 1 2.45 2.5h11.1a1 1 0 0 1 .99 1.37M4.7 13.72h6.6a1 1 0 0 0 1-.86l1.24-9.13a.5.5 0 0 0-.5-.59H2.46a.5.5 0 0 0-.5.59l1.25 9.13a1 1 0 0 0 .99.86"/><path d="M2.52 3.5 3.7 12.86q.04.36.36.64l-1.04-10.5zm11.96 0-.5 10.5q.32-.28.36-.64L15.48 3.5z"/></svg>';
   const SHIELD_SVG =
     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-shield-lock" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.338 1.59a61 61 0 0 0-2.837.856.48.48 0 0 0-.328.39c-.554 4.157.726 7.19 2.253 9.188a10.7 10.7 0 0 0 2.287 2.233c.346.244.652.42.893.533q.18.085.293.118a1 1 0 0 0 .101.025 1 1 0 0 0 .1-.025q.114-.034.294-.118c.24-.113.547-.29.893-.533a10.7 10.7 0 0 0 2.287-2.233c1.527-1.997 2.807-5.031 2.253-9.188a.48.48 0 0 0-.328-.39c-.651-.213-1.75-.56-2.837-.855C9.552 1.29 8.531 1.067 8 1.067c-.53 0-1.552.223-2.662.524zM5.072.56C6.157.265 7.31 0 8 0s1.843.265 2.928.56c1.11.3 2.229.655 2.887.87a1.54 1.54 0 0 1 1.044 1.262c.596 4.477-.787 7.795-2.465 9.99a11.8 11.8 0 0 1-2.517 2.453 7 7 0 0 1-1.048.625c-.28.132-.581.24-.829.24s-.548-.108-.829-.24a7 7 0 0 1-1.048-.625 11.8 11.8 0 0 1-2.517-2.453C1.928 10.487.545 7.169 1.141 2.692A1.54 1.54 0 0 1 2.185 1.43 63 63 0 0 1 5.072.56"/><path d="M9.5 6.5a1.5 1.5 0 0 1-1 1.415l.385 1.99a.5.5 0 0 1-.491.595h-.788a.5.5 0 0 1-.49-.595l.384-1.99a1.5 1.5 0 1 1 2-1.415z"/></svg>';
   const ATTENDANCE_SVG =
     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-clipboard2-check" viewBox="0 0 16 16" aria-hidden="true"><path d="M9.5 0a.5.5 0 0 1 .5.5.5.5 0 0 0 .5.5.5.5 0 0 1 .5.5V2a.5.5 0 0 1-.5.5h-5A.5.5 0 0 1 5 2v-.5a.5.5 0 0 1 .5-.5.5.5 0 0 0 .5-.5.5.5 0 0 1 .5-.5z"/><path d="M3 2.5a.5.5 0 0 1 .5-.5H4a.5.5 0 0 0 0-1h-.5A1.5 1.5 0 0 0 2 2.5v12A1.5 1.5 0 0 0 3.5 16h9a1.5 1.5 0 0 0 1.5-1.5v-12A1.5 1.5 0 0 0 12.5 1H12a.5.5 0 0 0 0 1h.5a.5.5 0 0 1 .5.5v12a.5.5 0 0 1-.5.5h-9a.5.5 0 0 1-.5-.5z"/><path d="M10.854 7.854a.5.5 0 0 0-.708-.708L7.5 9.793 6.354 8.646a.5.5 0 1 0-.708.708l1.5 1.5a.5.5 0 0 0 .708 0z"/></svg>';
 
-  let navBtn = null;
-  let adminBtn = null;
-  let attBtn = null;
+  let menuBtn = null;
+  let menuOutside = null;
+  let menuEscape = null;
+  function removeMenuDropdown() {
+    root().querySelectorAll(".bca-navmenu-drop").forEach((p) => p.remove());
+    if (menuOutside) { document.removeEventListener("click", menuOutside, true); menuOutside = null; }
+    if (menuEscape) { document.removeEventListener("keydown", menuEscape, true); menuEscape = null; }
+  }
 
   function refreshCopyUi() {
     const s = S();
-    for (const [btn, label] of [[navBtn, s.menuCopy], [adminBtn, s.adminMenu], [attBtn, s.attOpenPage]]) {
+    for (const [btn, label] of [[menuBtn, s.menuMore]]) {
       if (btn && document.contains(btn)) {
         btn.title = label;
         btn.setAttribute("aria-label", label);
@@ -1861,55 +1983,76 @@
     // navbar is available — the floating fallback is no longer needed
     root().querySelectorAll(".bca-fab").forEach((x) => x.remove());
 
-    const wantCopy = loggedIn && copyAllowed();
-    const wantAdmin = loggedIn && !!meUser?.isAdmin && features.supported;
+    const canCopy = loggedIn && copyAllowed();
+    const canDel = loggedIn && !!meUser && features.supported && features.canDeleteAllChat;
+    const canAdmin = loggedIn && !!meUser?.isAdmin && features.supported;
+    const canAtt = loggedIn && features.supported && features.canViewAttendance;
+    const wantMenu = loggedIn && (canCopy || canDel || canAtt || canAdmin);
 
-    if (wantCopy && !navBtn) {
-      navBtn = document.createElement("button");
-      navBtn.type = "button";
-      navBtn.className = "btn btn-outline-secondary btn-sm icon-button bca-navcopy";
-      navBtn.innerHTML = CLIPBOARD_SVG;
-      navBtn.addEventListener("click", (e) => {
+    if (wantMenu && !menuBtn) {
+      menuBtn = document.createElement("button");
+      menuBtn.type = "button";
+      menuBtn.className = "btn btn-outline-secondary btn-sm icon-button bca-navmenu";
+      menuBtn.innerHTML = MORE_SVG;
+      menuBtn.setAttribute("aria-haspopup", "true");
+      menuBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        toggleCopyPopup();
+        toggleMenuDropdown();
       });
     }
-    if (!wantCopy && navBtn) { navBtn.remove(); navBtn = null; }
-    if (wantCopy && navBtn && navBtn.parentElement !== group) group.appendChild(navBtn);
+    if (!wantMenu && menuBtn) { menuBtn.remove(); menuBtn = null; removeMenuDropdown(); }
+    if (wantMenu && menuBtn && menuBtn.parentElement !== group) group.appendChild(menuBtn);
+    // permission flips while the dropdown is open → rebuild it
+    if (!wantMenu || root().querySelector(".bca-navmenu-drop")) toggleMenuDropdown.refresh;
+    refreshMenuLabels();
+  }
 
-    if (wantAdmin && !adminBtn) {
-      adminBtn = document.createElement("button");
-      adminBtn.type = "button";
-      adminBtn.className = "btn btn-outline-secondary btn-sm icon-button bca-navadmin";
-      adminBtn.innerHTML = SHIELD_SVG;
-      adminBtn.addEventListener("click", (e) => {
+  /** the ⋯ dropdown — one item per feature the current user may use */
+  function toggleMenuDropdown() {
+    if (root().querySelector(".bca-navmenu-drop")) { removeMenuDropdown(); return; }
+    closePopup();
+    removeAttLinks();
+    const s = S();
+    const group = navGroup();
+    if (!group || !menuBtn) return;
+    const canCopy = loggedIn && copyAllowed();
+    const canDel = loggedIn && !!meUser && features.supported && features.canDeleteAllChat;
+    const canAdmin = loggedIn && !!meUser?.isAdmin && features.supported;
+    const canAtt = loggedIn && features.supported && features.canViewAttendance;
+    const pop = document.createElement("div");
+    pop.className = "bca-popup bca-navmenu-drop";
+    let items = "";
+    if (canCopy) items += '<button class="bca-navmenu-item" data-mi="copy" type="button">' + CLIPBOARD_SVG + "<span>" + s.menuCopy + "</span></button>";
+    if (canAtt) items += '<button class="bca-navmenu-item" data-mi="att" type="button">' + ATTENDANCE_SVG + "<span>" + s.attOpenPage + "</span></button>";
+    if (canAdmin) items += '<button class="bca-navmenu-item" data-mi="admin" type="button">' + SHIELD_SVG + "<span>" + s.adminMenu + "</span></button>";
+    if (canDel) items += '<button class="bca-navmenu-item bca-danger-item" data-mi="del" type="button">' + TRASH_SVG + "<span>" + s.delMenu + "</span></button>";
+    if (!items) return; // nothing permitted — never draw an empty menu
+    pop.innerHTML = items;
+    group.appendChild(pop);
+    menuOutside = (e) => {
+      if (!pop.contains(e.target) && !e.target.closest(".bca-navmenu")) removeMenuDropdown();
+    };
+    menuEscape = (e) => { if (e.key === "Escape") removeMenuDropdown(); };
+    document.addEventListener("click", menuOutside, true);
+    document.addEventListener("keydown", menuEscape, true);
+    pop.querySelectorAll(".bca-navmenu-item").forEach((item) => {
+      item.addEventListener("click", (e) => {
         e.stopPropagation();
-        toggleAdminPanel();
+        removeMenuDropdown();
+        const which = item.dataset.mi;
+        if (which === "copy") showExportPopup();
+        else if (which === "att") toggleAttLinks();
+        else if (which === "admin") showAdminPanel();
+        else if (which === "del") showDeletePopup();
       });
-    }
-    if (!wantAdmin && adminBtn) { adminBtn.remove(); adminBtn = null; }
-    if (wantAdmin && adminBtn && adminBtn.parentElement !== group) group.appendChild(adminBtn);
+    });
+  }
 
-    // attendance page: show a navbar link to EVERYONE who has permission
-    // (admins always; "selected" users when the admin grants it — features
-    // come from /api/chat/visibility, refreshed by the 1.2 s poll, so a
-    // revoked user loses the icon automatically). Opens in a NEW TAB (the
-    // attendance page is a standalone page, not part of the chat SPA).
-    const wantAtt = loggedIn && features.supported && features.canViewAttendance && !!features.hasAttendanceHtml;
-    if (wantAtt && !attBtn) {
-      attBtn = document.createElement("button");
-      attBtn.type = "button";
-      attBtn.className = "btn btn-outline-secondary btn-sm icon-button bca-navatt";
-      attBtn.innerHTML = ATTENDANCE_SVG;
-      attBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        toggleAttLinks();
-      });
-    }
-    if (!wantAtt && attBtn) { attBtn.remove(); attBtn = null; }
-    if (wantAtt && attBtn && attBtn.parentElement !== group) group.appendChild(attBtn);
-
-    refreshCopyUi();
+  function refreshMenuLabels() {
+    if (!menuBtn) return;
+    const s = S();
+    menuBtn.title = s.menuMore;
+    menuBtn.setAttribute("aria-label", s.menuMore);
   }
 
   /** attendance hub: a small dropdown under the icon —
@@ -2029,9 +2172,8 @@
   function teardown() {
     loggedIn = false;
     meUser = null;
-    if (navBtn) { navBtn.remove(); navBtn = null; }
-    if (adminBtn) { adminBtn.remove(); adminBtn = null; }
-    if (attBtn) { attBtn.remove(); attBtn = null; }
+    if (menuBtn) { menuBtn.remove(); menuBtn = null; }
+    removeMenuDropdown();
     if (typeof removeAttLinks === "function") removeAttLinks();
     root().querySelectorAll(".bca-fab").forEach((x) => x.remove());
     closePopup();
@@ -2051,16 +2193,36 @@
     else ensureNavButtons();
     applyUsersPanelVisibility();
   }
+  // the hub (ui-fixes.js) fires "bca:session" on every logged-out→logged-in
+  // flip — the SPA login navigates without a reload, so without this the
+  // buttons stayed hidden until the next manual reload (owner report 2026-11-07)
+  window.addEventListener("bca:session", (e) => {
+    if (e.detail?.loggedIn) evaluateSession();
+    else if (loggedIn) teardown();
+  });
+  // missed-flip self-healing (owner task 2026-11-07: "make me online"-এর পরের
+  // আইকনদুটো লগইনের পরে অটো আসে না, রিফ্রেশে আসে): the flip event can be
+  // missed (tab throttled in the background during login, listener-wiring
+  // race on a slow first paint) — the 1.2 s loop cross-checks the hub:
+  // hub says logged-in but this module is still torn down → evaluate now.
+  // Cheap: no HTTP, just an object read; the .bca-overlay check keeps the
+  // forced-password modal the sole owner of the screen.
+  setInterval(() => {
+    const sess = window.__bcaSession;
+    if (sess?.loggedIn && sess.me && !loggedIn && !document.querySelector(".bca-overlay")) {
+      evaluateSession();
+    }
+  }, 1200);
   // the React app navigates without reloading, so re-check on every route
   // change, re-attach the buttons if React wiped them, follow language flips,
   // and pick up admin setting changes within ~15 seconds
   let lastUrl = location.href;
   let lastLang = curLang();
   let visibilityTick = 0;
-  setInterval(async () => {
+  setInterval(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
-      evaluateSession();
+      evaluateSession(); // hub-driven (fetchMe reads __bcaSession — no HTTP)
     }
     if (curLang() !== lastLang) {
       lastLang = curLang();
@@ -2070,11 +2232,20 @@
       ensureNavButtons();
       ensureReactionPlus();
       if (++visibilityTick % 12 === 0) {
-        await refreshFeatures();
-        ensureNavButtons();
-        applyUsersPanelVisibility();
+        (async () => {
+          await refreshFeatures();
+          ensureNavButtons();
+          applyUsersPanelVisibility();
+        })();
       }
     }
   }, 1200);
-  evaluateSession();
+  // first evaluation once the hub has produced its first reading
+  const waitForHub = setInterval(() => {
+    if (window.__bcaSession) {
+      clearInterval(waitForHub);
+      evaluateSession();
+    }
+  }, 300);
+  setTimeout(() => clearInterval(waitForHub), 10000);
 })();

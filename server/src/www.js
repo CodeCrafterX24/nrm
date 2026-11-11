@@ -101,6 +101,9 @@ nodeServer.listen(port);
 nodeServer.on("error", onError);
 nodeServer.on("listening", onListening);
 log.info("Server is listening on port  " + port);
+// owner request 2026-11-08: daily sweep of unreferenced media older than the
+// retention window (default 30 days) — keeps the free-tier RAM/gist budget sane
+require("./services/mediaCleanup.js").startMediaCleanupLoop();
 /**
  * Normalize a port into a number, string, or false.
  */
@@ -147,5 +150,4 @@ function onListening() {
     const addr = nodeServer.address();
     const bind = typeof addr === "string" ? "pipe " + addr : "port " + addr?.port;
     (0, debug_1.default)("Listening on " + bind);
-    console.log("Listening on " + bind);
 }

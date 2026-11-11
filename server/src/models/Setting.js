@@ -4,15 +4,15 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.initialFrequentSymbols = exports.ATTENDANCE_DEFAULT_HTML = exports.SETTING_LIMITS = exports.PERMISSION_MODES = exports.Setting = void 0;
 const BaseModel_1 = require("./BaseModel.js");
 const initialFrequentSymbols = `
-✋
-আসসালামু আলাইকুম
-ওয়ালাইকুমুস সালাম
-<img src="https://" width="200" height="100" />
-<b></b>
-<i></i>
-<a href="https://" target="_blank">name</a>
-<figure><figcaption>Listen to the This:</figcaption><audio controls src="https://some_sound.mp3"></audio><a href="https://some_sound.mp3">Download audio</a></figure>
-`;
+بِسْمِ اللَّـهِ الرَّحْمَـٰنِ الرَّحِيمِ
+السَّلَامُ عَلَيْكُمْ وَرَحْمَةُ اللَّهِ وَبَرَكَاتُهُ
+وَعَلَيْكُمُ السَّلَامُ وَرَحْمَةُ اللَّهِ وَبَرَكَاتُهُ
+الْحَمْدُ لِلَّهِ الْكَرِيمِ الَّذِي أَسْبَغَ نِعَمَهُ عَلَيْنَا بَاطِنَةً وَظَاهِرَةً، الْعَزِيزِ الَّذِي خَضَعَتْ لِعِزَّتِهِ رِقَابُ الْجَبَابِرَةُ، وَأَشْهَدُ أَنْ لَا إِلَهَ إِلَّا اللَّهُ وَحْدَهُ لَا شَرِيكَ لَهُ شَهَادَةً نَرْجُو بِهَا النَّجَاةَ فِي الدَّارِ الْآخِرَةِ، وَأَشْهَدُ أَنَّ مُحَمَّدًا عَبْدُهُ وَرَسُولُهُ صَلَّى اللَّهُ عَلَيْهِ وَعَلَى آلِهِ وَصَحْبِهِ وَسَلَّمَ تَسْلِيمًا كَثِيرًا
+سُبْحَانَكَ اللّٰهُمَّ وَبِحَمْدِكَ، أَشْهَدُ أَنْ لاَ إِلَهَ إِلاَّ أَنْتَ، أَسْتَغْفِرُكَ وَأَتُوْبُ إِلَيْكَ
+<img src="IMAGE_LINK" style="max-width:100%" />
+<span class="message-body admin">Yellow text</span>
+<a href="LINK" >click here</a>
+<div style="background-color: #fdff77;color: #151362;border-radius:7px;padding:7px;font-family:Kalpurush;border:4px solid rgb(189, 19, 79);box-shadow: 3px 5px 1px #ccc;">special_text</div>`;
 exports.initialFrequentSymbols = initialFrequentSymbols;
 
 /**
@@ -32,6 +32,8 @@ const SETTING_LIMITS = {
     fsNotice: 100000,
     /** fullscreen-notice confirm button label (plain text, short) */
     fsNoticeOkLabel: 60,
+    /** fullscreen-notice button position: left | center | right */
+    fsNoticeBtnAlign: 6,
     /** one username entry */
     username: 50,
     /** members of a selected-users list */
@@ -164,6 +166,15 @@ class Setting extends BaseModel_1.BaseModel {
     attendanceViewMode;
     /** usernames allowed to open the attendance page when the mode is "selected" */
     attendanceSelected;
+    /** who may delete the whole chat history — "all" | "admin" | "selected" */
+    deleteChatMode;
+    /** usernames allowed to delete the whole history when deleteChatMode === "selected" */
+    deleteChatSelected;
+    /** who may send media messages (voice/photo) — "all" | "admin" | "selected";
+        admins always can (owner request 2026-11-09: per-feature media on/off) */
+    mediaMode;
+    /** usernames allowed to send media when mediaMode === "selected" */
+    mediaSelected;
     /** raw, admin-editiable html rendered by GET /attendance */
     attendanceHtml;
     /** shared plain-text note shown on the attendance page (admin + selected users) */
@@ -174,6 +185,8 @@ class Setting extends BaseModel_1.BaseModel {
     fsNoticeUpdatedAt;
     /** custom text for the fullscreen-notice confirm button ("" = default) */
     fsNoticeOkLabel;
+    /** button position inside the fullscreen overlay: left (default) | center | right */
+    fsNoticeBtnAlign;
     /** where new chat messages persist: "gist" (durable, slower) | "memory"
         (server-local, fast — lost on restart/redeploy). User+Setting always
         persist in the gist regardless. */
@@ -203,6 +216,11 @@ class Setting extends BaseModel_1.BaseModel {
             ? "admin"
             : normalizeMode(json.attendanceViewMode, "admin");
         this.attendanceSelected = normalizeUsernames(json.attendanceSelected);
+        // deleting the whole history is destructive — default stays admin-only
+        this.deleteChatMode = normalizeMode(json.deleteChatMode, "admin");
+        this.deleteChatSelected = normalizeUsernames(json.deleteChatSelected);
+        this.mediaMode = normalizeMode(json.mediaMode, "all");
+        this.mediaSelected = normalizeUsernames(json.mediaSelected);
         this.attendanceHtml = typeof json.attendanceHtml === "string"
             ? json.attendanceHtml.slice(0, SETTING_LIMITS.attendanceHtml)
             : "";
@@ -214,6 +232,7 @@ class Setting extends BaseModel_1.BaseModel {
             : "";
         this.fsNoticeUpdatedAt = typeof json.fsNoticeUpdatedAt === "string" ? json.fsNoticeUpdatedAt : "";
         this.fsNoticeOkLabel = typeof json.fsNoticeOkLabel === "string" ? json.fsNoticeOkLabel.slice(0, SETTING_LIMITS.fsNoticeOkLabel) : "";
+        this.fsNoticeBtnAlign = (json.fsNoticeBtnAlign === "center" || json.fsNoticeBtnAlign === "right") ? json.fsNoticeBtnAlign : "left";
         this.messageStoreMode = json.messageStoreMode === "gist" ? "gist" : "memory";
     }
 }

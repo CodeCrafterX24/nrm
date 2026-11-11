@@ -74,6 +74,23 @@ const canViewAttendance = (setting, user) =>
         user
     );
 
+/** who may delete the whole chat history (destructive — default admin-only) */
+const canDeleteAllChat = (setting, user) =>
+    canUseFeature(
+        normalizeMode(setting?.deleteChatMode, "admin"),
+        setting?.deleteChatSelected,
+        user
+    );
+
+/** who may send media messages (voice/photo) — default: everyone (the historical
+ *  behavior before this became configurable, owner request 2026-11-09) */
+const canUseMedia = (setting, user) =>
+    canUseFeature(
+        normalizeMode(setting?.mediaMode, "all"),
+        setting?.mediaSelected,
+        user
+    );
+
 /**
  * Response payload of GET /api/chat/visibility — every logged-in user reads it,
  * so it stays free of usernames: only the resolved booleans plus the mode.
@@ -88,6 +105,12 @@ const permissionSummary = (setting, user) => ({
     attendanceMode: normalizeMode(setting?.attendanceViewMode, "admin"),
     attendanceSelectedCount: memberList(setting?.attendanceSelected).length,
     canViewAttendance: canViewAttendance(setting, user),
+    deleteChatMode: normalizeMode(setting?.deleteChatMode, "admin"),
+    deleteChatSelectedCount: memberList(setting?.deleteChatSelected).length,
+    canDeleteAllChat: canDeleteAllChat(setting, user),
+    mediaMode: normalizeMode(setting?.mediaMode, "all"),
+    mediaSelectedCount: memberList(setting?.mediaSelected).length,
+    canUseMedia: canUseMedia(setting, user),
     hasAttendanceHtml: typeof setting?.attendanceHtml === "string" && setting.attendanceHtml.length > 0,
     version: isset(setting?.version) ? setting.version : undefined,
 });
@@ -105,6 +128,10 @@ const adminSettingsPayload = (setting) => ({
     onlineUsersSelected: memberList(setting?.onlineUsersSelected),
     attendanceMode: normalizeMode(setting?.attendanceViewMode, "admin"),
     attendanceSelected: memberList(setting?.attendanceSelected),
+    deleteChatMode: normalizeMode(setting?.deleteChatMode, "admin"),
+    deleteChatSelected: memberList(setting?.deleteChatSelected),
+    mediaMode: normalizeMode(setting?.mediaMode, "all"),
+    mediaSelected: memberList(setting?.mediaSelected),
 });
 
 // ---- exports (assigned after declarations) ----
@@ -112,8 +139,10 @@ exports.MODES = MODES;
 exports.adminSettingsPayload = adminSettingsPayload;
 exports.canSeeOnlineUsers = canSeeOnlineUsers;
 exports.canUseCopyAll = canUseCopyAll;
+exports.canUseMedia = canUseMedia;
 exports.canUseFeature = canUseFeature;
 exports.canViewAttendance = canViewAttendance;
+exports.canDeleteAllChat = canDeleteAllChat;
 exports.isListed = isListed;
 exports.normalizeMode = normalizeMode;
 exports.permissionSummary = permissionSummary;

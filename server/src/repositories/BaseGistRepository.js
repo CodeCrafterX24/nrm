@@ -146,6 +146,8 @@ class BaseGistRepository {
             }
             catch (err) {
                 log.error(`gist load attempt ${i}/${attempts} for ${this.modelName} failed: ${err.message}`);
+                if (i === attempts && /Malformed UTF-8|empty output|utf-8/i.test(err.message))
+                    log.error(`${this.modelName}: the stored gist could not be DECRYPTED with the current env encryption_password — either the password changed since the gist was written, or APP_ID points at another room's gists. Fix the env (same encryption_password + same APP_ID as the deploy that created the gists) and restart; the stored data itself is intact.`);
                 if (i === attempts)
                     throw err;
                 await new Promise((r) => setTimeout(r, Math.min(i * 5, 30) * 1000));

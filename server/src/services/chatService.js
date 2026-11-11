@@ -230,5 +230,13 @@ const deleteAllChat = async (res) => {
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     //@ts-ignore
     await repository.removeAll();
+    // owner request 2026-11-08: a deleted conversation leaves no orphan media
+    try {
+        const mediaStore = require("./mediaStore.js");
+        await mediaStore.removeAllMedia();
+    }
+    catch (err) {
+        log.error("media cleanup after delete-all failed:", err.message);
+    }
 };
 exports.deleteAllChat = deleteAllChat;

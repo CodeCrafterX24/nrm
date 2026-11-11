@@ -53,12 +53,13 @@
       chars: "chars",
       cardBadge: "addon",
       okLabelLabel: "Button text (empty = \"Understood\")",
+      btnAlignLabel: "Button position",
+      btnAlignLeft: "Left", btnAlignCenter: "Center", btnAlignRight: "Right",
       modeLabel: "Message storage (server speed)",
       modeGist: "GitHub Gist — durable (slower)",
       modeMemory: "RAM — fast (messages lost on redeploy)",
       modeHint: "Users & settings always stay on the Gist in both modes.",
       modeSaved: "✓ Storage mode saved",
-      okLabelLabel: "Button text (empty = \"Understood\")",
     },
     bn: {
       ok: "বুঝেছি",
@@ -79,12 +80,13 @@
       chars: "অক্ষর",
       cardBadge: "অ্যাড-অন",
       okLabelLabel: "বাটনের লেখা (খালি = “বুঝেছি”)",
+      btnAlignLabel: "বাটনের অবস্থান",
+      btnAlignLeft: "বামে", btnAlignCenter: "মাঝে", btnAlignRight: "ডানে",
       modeLabel: "মেসেজ স্টোরেজ (সার্ভার গতি)",
       modeGist: "GitHub Gist — স্থায়ী (ধীর)",
       modeMemory: "RAM — দ্রুত (রিডিপ্লয়ে মেসেজ মুছে যাবে)",
       modeHint: "দুই অবস্থাতেই ইউজার ও সেটিংস Gist-এই থাকবে।",
       modeSaved: "✓ স্টোরেজ মোড সেভ হয়েছে",
-      okLabelLabel: "বাটনের লেখা (খালি = “বুঝেছি”)",
     },
   };
   const S = () => STRINGS[curLang()];
@@ -130,7 +132,7 @@
     document.body.classList.remove("bca-fslock");
   }
 
-  function showOverlay(html, okLabel) {
+  function showOverlay(html, okLabel, align) {
     closeOverlay();
     const overlay = document.createElement("div");
     overlay.className = "bca-fsoverlay";
@@ -143,6 +145,10 @@
       </div>`;
     const okBtn = overlay.querySelector(".bca-fsok");
     okBtn.textContent = okLabel || S().ok;
+    if (okLabel) okBtn.dataset.custom = okLabel; // survives live language flips
+    // owner request: the button may sit left/center/right (default left —
+    // the historical inline flow)
+    overlay.classList.add("bca-fsok-align-" + (align === "center" || align === "right" ? align : "left"));
     okBtn.addEventListener("click", closeOverlay);
     const inner = overlay.querySelector(".bca-fsinner");
     // admin-authored raw html/css/js — the SAME trust decision as the
@@ -182,6 +188,7 @@
       notice: typeof got.body.notice === "string" ? got.body.notice : "",
       updatedAt: got.body.updatedAt || "",
       okLabel: typeof got.body.okLabel === "string" ? got.body.okLabel.slice(0, 60) : "",
+      btnAlign: got.body.btnAlign === "center" || got.body.btnAlign === "right" ? got.body.btnAlign : "left",
       messageStoreMode: got.body.messageStoreMode === "gist" ? "gist" : "memory",
     };
     return fsNoticeCache;
@@ -201,7 +208,7 @@
     if (loginAt && fsSeenLoginAt() === loginAt) return;
     shownFor = loginAt;
     markFsSeen(loginAt);
-    showOverlay(fsNoticeCache.notice, fsNoticeCache.okLabel);
+    showOverlay(fsNoticeCache.notice, fsNoticeCache.okLabel, fsNoticeCache.btnAlign);
   }
 
   // ---------- notice change watch (lightweight /users/me loginAt polling) ----------
@@ -240,6 +247,12 @@
       <textarea class="bca-fseditor" spellcheck="false" wrap="off"></textarea>
       <div class="bca-fslabel bca-fsoklabel-label"></div>
       <input type="text" class="bca-fsoklabel" maxlength="60" />
+      <div class="bca-fslabel bca-fsalignlabel"></div>
+      <select class="bca-fsalign">
+        <option value="left"></option>
+        <option value="center"></option>
+        <option value="right"></option>
+      </select>
       <div class="bca-fslabel bca-fsmodelabel"></div>
       <div class="bca-fsmodeswitch">
         <label class="bca-fsmodeopt"><input type="radio" name="bca-fs-storemode" value="gist" /><span class="bca-fsmodegist"></span></label>
@@ -258,6 +271,10 @@
     const okLabelInput = box.querySelector(".bca-fsoklabel");
     box.querySelector(".bca-fsoklabel-label").textContent = s.okLabelLabel;
     okLabelInput.placeholder = s.ok;
+    const alignSel = box.querySelector(".bca-fsalign");
+    box.querySelector(".bca-fsalignlabel").textContent = s.btnAlignLabel;
+    const alignOpts = { left: s.btnAlignLeft, center: s.btnAlignCenter, right: s.btnAlignRight };
+    alignSel.querySelectorAll("option").forEach((o) => { o.textContent = alignOpts[o.value] || o.value; });
     box.querySelector(".bca-fsmodelabel").textContent = s.modeLabel;
     box.querySelector(".bca-fsmodegist").textContent = s.modeGist;
     box.querySelector(".bca-fsmodememory").textContent = s.modeMemory;
@@ -279,10 +296,11 @@
     };
     editor.addEventListener("input", () => { paintCount(); msg.textContent = ""; });
 
-    const saveNow = async (overrideHtml, overrideOkLabel, overrideMode) => {
+    const saveNow = async (overrideHtml, overrideOkLabel, overrideMode, overrideAlign) => {
       const html = typeof overrideHtml === "string" ? overrideHtml : editor.value;
       const okLabel = typeof overrideOkLabel === "string" ? overrideOkLabel : okLabelInput.value.trim();
       const mode = typeof overrideMode === "string" ? overrideMode : (modeRadios().find((r) => r.checked)?.value || null);
+      const align = typeof overrideAlign === "string" ? overrideAlign : (alignSel.value || "left");
       if (html.length > LIMIT) { msg.textContent = s.tooLarge; return false; }
       saveBtn.disabled = true;
       const label = saveBtn.textContent;
@@ -293,7 +311,7 @@
           method: "PUT",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ notice: html, okLabel, ...(mode ? { messageStoreMode: mode } : {}) }),
+          body: JSON.stringify({ notice: html, okLabel, btnAlign: align, ...(mode ? { messageStoreMode: mode } : {}) }),
         });
         if (res.status === 401) { msg.textContent = s.sessionExpired; return false; }
         if (!res.ok) {
@@ -304,7 +322,7 @@
         editor.value = html;
         paintCount();
         msg.textContent = s.saved;
-        fsNoticeCache = { notice: html, updatedAt: new Date().toISOString(), okLabel };
+        fsNoticeCache = { notice: html, updatedAt: new Date().toISOString(), okLabel, btnAlign: align };
         return true;
       } catch {
         msg.textContent = s.noServer;
@@ -316,7 +334,12 @@
     };
 
     saveBtn.addEventListener("click", () => saveNow());
-    previewBtn.addEventListener("click", () => { if (editor.value.trim()) showOverlay(editor.value); });
+    previewBtn.addEventListener("click", () => { if (editor.value.trim()) showOverlay(editor.value, okLabelInput.value.trim(), alignSel.value); });
+    // button-position select saves immediately (same pattern as the storage mode)
+    alignSel.addEventListener("change", async () => {
+      const okNow = await saveNow(undefined, undefined, undefined, alignSel.value);
+      if (okNow) showToast(s.saved);
+    });
     modeRadios().forEach((radio) =>
       radio.addEventListener("change", async () => {
         const okNow = await saveNow(undefined, undefined, radio.value);
@@ -336,6 +359,7 @@
       if (fsNoticeCache) {
         editor.value = fsNoticeCache.notice;
         okLabelInput.value = fsNoticeCache.okLabel || "";
+        alignSel.value = fsNoticeCache.btnAlign || "left";
         const mode = fsNoticeCache.messageStoreMode || "memory";
         modeRadios().forEach((r) => { r.checked = r.value === mode; });
         paintCount();
@@ -442,16 +466,17 @@
   let lastOverlayFetch = 0; // throttle for the overlay-open notice refetch
   async function evaluate() {
     try {
-      const res = await fetch("/api/users/me", { credentials: "same-origin" });
-      if (!res.ok) {
+      // session state comes from the shared hub (window.__bcaSession) — no own
+      // /api/users/me call (owner request: এক কল, সবাই শোনে)
+      const sess = window.__bcaSession;
+      const next = sess?.loggedIn ? sess.me : null;
+      if (!next) {
         if (loggedIn) {
           loggedIn = false; me = null; fsNoticeCache = null; shownFor = null; lastLoginAt = null;
           closeOverlay(); removeAdminCard();
         }
         return;
       }
-      const next = await res.json().catch(() => null);
-      if (!next) return;
       loggedIn = true;
       me = next;
       // a changed loginAt = a fresh login (also catches in-app logout→login
@@ -474,7 +499,10 @@
           const had = fsNoticeCache;
           await refetchNotice();
           if (fsNoticeCache && fsNoticeCache.updatedAt !== (had && had.updatedAt)) {
-            showOverlay(fsNoticeCache.notice, fsNoticeCache.okLabel);
+            // always carry the cached okLabel/align — the refetch above just
+            // refreshed them; dropping them reset the custom button text
+            // (owner bug: edited label flipped back to "বুঝেছি")
+            showOverlay(fsNoticeCache.notice, fsNoticeCache.okLabel, fsNoticeCache.btnAlign);
           }
         }
       } else {
@@ -483,15 +511,47 @@
       if (curLang() !== lastLang) {
         lastLang = curLang();
         const okBtn = host().querySelector(".bca-fsok");
-        if (okBtn) okBtn.textContent = S().ok;
+        if (okBtn) okBtn.textContent = okBtn.dataset.custom || S().ok; // keep the admin's custom label
         const title = document.querySelector(".bca-fscardtitle");
         if (title) title.textContent = S().editorTitle;
         const badge = document.querySelector(".bca-fsbadge");
         if (badge) badge.textContent = S().cardBadge;
+        // editor-card labels live-update too (align selector options included)
+        const alignLabel = document.querySelector(".bca-fsalignlabel");
+        if (alignLabel) alignLabel.textContent = S().btnAlignLabel;
+        const alignSel = document.querySelector(".bca-fsalign");
+        if (alignSel) {
+          const alignOpts = { left: S().btnAlignLeft, center: S().btnAlignCenter, right: S().btnAlignRight };
+          alignSel.querySelectorAll("option").forEach((o) => { o.textContent = alignOpts[o.value] || o.value; });
+        }
+        const okLabelLabel = document.querySelector(".bca-fsoklabel-label");
+        if (okLabelLabel) okLabelLabel.textContent = S().okLabelLabel;
       }
     } catch { /* transient network hiccup */ }
   }
 
-  setInterval(evaluate, 1200);
-  evaluate();
+  // session hub subscriber (owner request): no own poll — ui-fixes.js owns
+  // the single /api/users/me request; we react to state transitions and
+  // keep the 5 s overlay-open refetch for mid-session admin edits.
+  let hubState;
+  setInterval(async () => {
+    const sess = window.__bcaSession;
+    if (!sess) return;
+    await evaluate(); // hub-fed (no HTTP inside) — admin-card/scroll-guard/overlay-refetch
+    if (hubState !== undefined && hubState === sess.loggedIn) return; // no transition
+    hubState = sess.loggedIn;
+    if (sess.loggedIn) {
+      loggedIn = true;
+      me = sess.me;
+      if (fsSupported) await refetchNotice();
+      maybeShow();
+      ensureAdminCard();
+      ensureScrollGuard();
+    } else {
+      if (loggedIn) {
+        loggedIn = false; me = null; fsNoticeCache = null; shownFor = null;
+        closeOverlay(); removeAdminCard();
+      }
+    }
+  }, 1500);
 })();

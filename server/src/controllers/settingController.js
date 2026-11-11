@@ -28,7 +28,7 @@ const saveAdminSettings = async (req, res) => {
     try {
         const repository = (0, config_1.getSettingRepository)();
         const setting = await getSetting();
-        const { copyAllMode, copyAllSelected, showOnlineUsers, onlineUsersSelected, attendanceViewMode, attendanceSelected, } = req.body || {};
+        const { copyAllMode, copyAllSelected, showOnlineUsers, onlineUsersSelected, attendanceViewMode, attendanceSelected, deleteChatMode, deleteChatSelected, mediaMode, mediaSelected, } = req.body || {};
         if (copyAllMode !== undefined) {
             if (!permissions_1.MODES.includes(copyAllMode))
                 return res.sendStatus(400);
@@ -55,6 +55,20 @@ const saveAdminSettings = async (req, res) => {
         }
         if (attendanceSelected !== undefined)
             setting.attendanceSelected = (0, Setting_1.normalizeUsernames)(attendanceSelected);
+        if (deleteChatMode !== undefined) {
+            if (!permissions_1.MODES.includes(deleteChatMode))
+                return res.sendStatus(400);
+            setting.deleteChatMode = deleteChatMode;
+        }
+        if (deleteChatSelected !== undefined)
+            setting.deleteChatSelected = (0, Setting_1.normalizeUsernames)(deleteChatSelected);
+        if (mediaMode !== undefined) {
+            if (!permissions_1.MODES.includes(mediaMode))
+                return res.sendStatus(400);
+            setting.mediaMode = mediaMode;
+        }
+        if (mediaSelected !== undefined)
+            setting.mediaSelected = (0, Setting_1.normalizeUsernames)(mediaSelected);
         await repository.update(setting);
         res.status(200).json((0, permissions_1.permissionSummary)(setting, req.session?.userInfo));
     }
@@ -120,7 +134,8 @@ const getAttendanceNote = async (req, res) => {
         const user = req.session?.userInfo;
         if (!(0, permissions_1.canViewAttendance)(setting, user))
             return res.sendStatus(403);
-        res.status(200).json({ note: typeof setting.attendanceNote === "string" ? setting.attendanceNote : "" });
+        const state = await NoteService_1.getNoteState();
+        res.status(200).json({ note: state.text, tabs: state.tabs });
     }
     catch (error) {
         handleError(error, res);
@@ -133,14 +148,14 @@ const saveAttendanceNote = async (req, res) => {
         const user = req.session?.userInfo;
         if (!(0, permissions_1.canViewAttendance)(setting, user))
             return res.sendStatus(403);
-        const note = (0, attendanceService_1.validateAttendanceNote)(req.body?.note);
-        if (note === null)
-            return res.status(400).json({ errorMessage: "client_error.too_large_error" });
-        const repository = (0, config_1.getSettingRepository)();
-        setting.attendanceNote = note;
-        await repository.update(setting);
-        log.info(`attendance note saved (${note.length} chars)`);
-        res.status(200).json({ note });
+        // unlimited note (chunked storage) — only a runaway-payload guard remains
+        if (typeof req.body?.note !== "string")
+            return res.status(400).json({ errorMessage: "client_error.client_error" });
+        if (req.body.note.length > NoteService_1.MAX_NOTE_CHARS)
+            return res.status(413).json({ errorMessage: "client_error.too_large_error" });
+        const state = await NoteService_1.saveNoteText(req.body.note);
+        log.info(`note saved (${state.chars} chars, ${state.tabs} tabs)`);
+        res.status(200).json({ note: (await NoteService_1.getNoteState()).text, tabs: state.tabs });
     }
     catch (error) {
         handleError(error, res);
@@ -156,6 +171,7 @@ const SettingService_1 = require("../services/settingService.js");
 const htmlSanitizer_1 = require("../services/htmlSanitizer.js");
 const permissions_1 = require("../services/permissions.js");
 const attendanceService_1 = require("../services/attendanceService.js");
+const NoteService_1 = require("../services/noteService.js");
 // the message-store switch changes which repo getMessageRepository() returns
 const repositoryFactoryRef = require("../config/repositoryFactory.js");
 const log = (0, logger_1.default)(__filename);
@@ -244,6 +260,7 @@ const getFsNotice = async (req, res) => {
             notice: setting.fsNotice || "",
             updatedAt: setting.fsNoticeUpdatedAt || "",
             okLabel: setting.fsNoticeOkLabel || "",
+            btnAlign: setting.fsNoticeBtnAlign === "center" || setting.fsNoticeBtnAlign === "right" ? setting.fsNoticeBtnAlign : "left",
             messageStoreMode: setting.messageStoreMode || "memory",
         });
     }
@@ -262,12 +279,14 @@ const updateFsNotice = async (req, res) => {
     try {
         const raw = typeof req.body?.notice === "string" ? req.body.notice : "";
         const okLabel = typeof req.body?.okLabel === "string" ? req.body.okLabel.trim().slice(0, Setting_1.SETTING_LIMITS.fsNoticeOkLabel) : "";
+        const btnAlign = req.body?.btnAlign === "center" || req.body?.btnAlign === "right" ? req.body.btnAlign : "left";
         if (raw.length > Setting_1.SETTING_LIMITS.fsNotice)
             return res.status(400).json({ errorMessage: "client_error.too_large_error" });
         const repository = (0, config_1.getSettingRepository)();
         const setting = await getSetting();
         setting.fsNotice = raw;
         setting.fsNoticeOkLabel = okLabel;
+        setting.fsNoticeBtnAlign = btnAlign;
         setting.fsNoticeUpdatedAt = new Date().toISOString();
         // the message-store switch rides along with every fs-notice save —
         // the admin panel toggles it through this endpoint
@@ -347,7 +366,9 @@ const canWeChat = async (req, res) => {
 };
 exports.canWeChat = canWeChat;
 const deleteChat = async (req, res) => {
-    if (!req.session?.userInfo?.isAdmin)
+    // owner request 2026-11-08: deleting the whole history is a guarded
+    // FEATURE now (deleteChatMode admin|all|selected) — admins always can
+    if (!(0, permissions_1.canDeleteAllChat)(await getSetting(), req.session?.userInfo))
         return res.sendStatus(403);
     log.debug("Deleting all messages...");
     try {

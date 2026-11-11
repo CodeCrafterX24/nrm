@@ -16,7 +16,9 @@ const logger_1 = __importDefault(require("../logger.js"));
 const ClientError_1 = require("../models/ClientError.js");
 const SocketEvents_1 = require("./socketEvents.js");
 const User_1 = require("../models/User.js");
+const Message_1 = require("../models/Message.js");
 const htmlSanitizer_1 = require("../services/htmlSanitizer.js");
+const permissions_1 = require("../services/permissions.js");
 const log = (0, logger_1.default)(__filename);
 /** every handler must acknowledge errors, otherwise the sender waits forever */
 function safeCallback(callback, payload) {
@@ -27,11 +29,18 @@ function safeCallback(callback, payload) {
 async function handleChatMessage(message, callback, socket) {
     log.debug(`Received chat message: ${JSON.stringify(message)}`);
     try {
-        if (!message?.text?.trim()) {
+        // owner request 2026-11-08: media messages (voice/photo) may carry an
+        // empty text — a media object alone is a valid message body. Normalize
+        // through the model FIRST so a malformed media payload cannot masquerade
+        // as a media message (the model nulls a bad mediaId/mime).
+        const normalized = new Message_1.Message(message);
+        const hasMedia = !!(normalized.media && normalized.media.mediaId);
+        message.media = normalized.media;
+        if ((!message?.text?.trim()) && !hasMedia) {
             safeCallback(callback, ClientError_1.ClientError.invalidError());
             return;
         }
-        if (message.text.length > htmlSanitizer_1.MAX_MESSAGE_CHARS) {
+        if (message.text && message.text.length > htmlSanitizer_1.MAX_MESSAGE_CHARS) {
             safeCallback(callback, ClientError_1.ClientError.tooLargeError());
             return;
         }
@@ -42,19 +51,26 @@ async function handleChatMessage(message, callback, socket) {
             ? User_1.RoleEnum.ADMIN
             : User_1.RoleEnum.NON_ADMIN;
         // HTML in messages is supported — sanitize against a permissive allowlist server-side
-        message.text = (0, htmlSanitizer_1.sanitizeMessageHtml)(message.text);
-        if (!message.text.trim()) {
+        normalized.text = message.text ? (0, htmlSanitizer_1.sanitizeMessageHtml)(message.text) : "";
+        normalized.username = message.username;
+        normalized.role = message.role;
+        normalized.time = message.time;
+        if ((!normalized.text || !normalized.text.trim()) && !hasMedia) {
             safeCallback(callback, ClientError_1.ClientError.invalidError());
             return;
         }
         // Process the message or perform any necessary actions
-        message.time = new Date().toISOString();
-        // save
-        const result = await repository.add(message);
+        normalized.time = new Date().toISOString();
+        // save — the model-normalized copy (media validated, text sanitized)
+        const result = await repository.add(normalized);
         // Call the callback function to acknowledge the event
         safeCallback(callback, result);
-        // Broadcast the chat message to all connected clients except the sender
-        socket.broadcast.emit(SocketEvents_1.socketEvents.chatMessage, message);
+        // Broadcast the chat message to all connected clients except the sender.
+        // Parity contract with the Cloudflare build (roomdo.js): the broadcast
+        // carries the SAVED message (id + sanitized text + validated media),
+        // not the raw client payload — receivers (including the sender's other
+        // devices) append it directly instead of falling into a resync.
+        socket.broadcast.emit(SocketEvents_1.socketEvents.chatMessage, result);
     }
     catch (err) {
         log.error(err);
@@ -151,7 +167,11 @@ async function handleReactMessage(reactedMessage, socket, callback) {
 async function handleDeleteChat(socket, callback) {
     log.debug(`Received delete chat request.`);
     try {
-        if (!socket.request.session.userInfo.isAdmin) {
+        // owner request 2026-11-08: guarded FEATURE (deleteChatMode), not just
+        // isAdmin — admins always can; mode/selected per the admin panel
+        const setting = await (0, config_1.getSettingRepository)().get();
+        const allowed = permissions_1.canDeleteAllChat(setting[0], socket.request.session.userInfo);
+        if (!allowed) {
             safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
             return;
         }
@@ -183,6 +203,16 @@ async function handleDeleteMessage(id, socket, callback) {
         if (!message) {
             safeCallback(callback, { status: false });
             return;
+        }
+        // owner request 2026-11-08: a deleted single message drops its media too
+        if (message.media && message.media.mediaId) {
+            try {
+                const mediaStore = require("../services/mediaStore.js");
+                await mediaStore.removeMedia(message.media.mediaId);
+            }
+            catch (err) {
+                log.error("media cleanup after delete failed:", err.message);
+            }
         }
         if (message.username != loggedInUser.username && !loggedInUser.isAdmin) {
             safeCallback(callback, ClientError_1.ClientError.accessDeniedError());

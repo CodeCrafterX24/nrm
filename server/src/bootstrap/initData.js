@@ -60,8 +60,19 @@ const insertDummyAdminUser = async () => {
     }
 };
 async function initializeSettingAndUser() {
-    await initializeSetting();
-    await insertDummyAdminUser();
+    // Boot hardening (owner-reported 2026-11-07: wrong/new encryption_password
+    // made the Setting gist load fail all 8 attempts -> this promise rejected
+    // unhandled -> the process exited -> Render restart-looped -> EVERY request
+    // 502'd, including the first Admin login). Storage problems must never take
+    // the whole server down: log loudly, keep serving, retry on demand — every
+    // later get() call re-enters ensureLoaded() and retries the load anyway.
+    try {
+        await initializeSetting();
+        await insertDummyAdminUser();
+    }
+    catch (err) {
+        log.error("boot storage init failed (server stays up; reads/writes will retry):", err.message);
+    }
     // apply the admin's saved message-store switch (gist | memory) at boot
     try {
         const settings = await config_1.getSettingRepository().get();

@@ -4,7 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.exportChat = exports.reactMessage = exports.getMissingMessages = exports.getMessages = void 0;
+exports.sendMessage = exports.getMedia = exports.uploadMedia = exports.exportChat = exports.reactMessage = exports.getMissingMessages = exports.getMessages = void 0;;
 const socketService_1 = require("../socket/socketService.js");
 const SocketEvents_1 = require("../socket/socketEvents.js");
 const socketEvents_1 = require("../socket/socketEvents.js");
@@ -13,6 +13,9 @@ const ClientError_1 = require("../models/ClientError.js");
 const config_1 = require("../config/repositoryFactory.js");
 const chatService_1 = require("../services/chatService.js");
 const permissions_1 = require("../services/permissions.js");
+const Message_1 = require("../models/Message.js");
+const User_1 = require("../models/User.js");
+const htmlSanitizer_1 = require("../services/htmlSanitizer.js");
 const log = (0, logger_1.default)(__filename);
 const clampLimit = (value) => {
     const n = parseInt(String(value ?? ""), 10);
@@ -187,3 +190,97 @@ const handleError = (error, res) => {
         res.sendStatus(500);
     }
 };
+
+// ------------------------------------------------------------------
+// Chat media (owner request 2026-11-08): voice messages + photos.
+// POST /api/chat/media  { mime, data(base64) } -> { mediaId, bytes }
+// GET  /api/chat/media/:id -> raw bytes with the stored content-type
+// The payload never touches a Message: the message carries only the id.
+// ------------------------------------------------------------------
+const mediaStore_1 = require("../services/mediaStore.js");
+const uploadMedia = async (req, res) => {
+    try {
+        const user = req.session?.userInfo;
+        if (!user?.username)
+            return res.sendStatus(401);
+        // owner request 2026-11-09: media sending is a per-feature permission
+        // (mediaMode all|admin|selected) — the UI hides the buttons, but the
+        // real guard stays here. Settings store may still be booting — fail
+        // closed (403) like settingController.getSetting does
+        const settings = await (0, config_1.getSettingRepository)().get();
+        if (!permissions_1.canUseMedia(settings[0], user))
+            return res.status(403).json({ message: "client_error.access_denied" });
+        const { mime, data } = req.body || {};
+        const out = await mediaStore_1.putMedia({ mime, data });
+        res.status(200).json(out);
+    }
+    catch (error) {
+        if (/unsupported media type|empty media|too large/.test(String(error?.message)))
+            return res.status(400).json({ message: error.message });
+        log.error(error);
+        res.sendStatus(500);
+    }
+};
+exports.uploadMedia = uploadMedia;
+const getMedia = async (req, res) => {
+    try {
+        if (!req.session?.userInfo?.username)
+            return res.sendStatus(401);
+        const media = await mediaStore_1.getMedia(String(req.params.id || ""));
+        if (!media)
+            return res.sendStatus(404);
+        const buf = Buffer.from(media.data, "base64");
+        res.setHeader("Content-Type", media.mime);
+        res.setHeader("Content-Length", String(buf.length));
+        res.setHeader("Cache-Control", "private, max-age=86400");
+        res.status(200).end(buf);
+    }
+    catch (error) {
+        log.error(error);
+        res.sendStatus(500);
+    }
+};
+exports.getMedia = getMedia;
+/**
+ * REST twin of the socket "chatMessage" handler (server/src/socket/chatHandler.js)
+ * — the addon's media sender uses it as the fallback when no socket.io client
+ * is available. Same normalization, same sanitizer, same saved-message
+ * broadcast (id included, Cloudflare-parity) as the socket path.
+ */
+const sendMessage = async (req, res) => {
+    try {
+        const user = req.session?.userInfo;
+        if (!user?.username)
+            return res.sendStatus(401);
+        const raw = req.body || {};
+        // media-only fallback needs the same model normalization the socket
+        // path uses (a malformed media payload must not masquerade as media)
+        const normalized = new Message_1.Message(raw);
+        const hasMedia = !!(normalized.media && normalized.media.mediaId);
+        const rawText = typeof raw?.text === "string" ? raw.text : "";
+        if (!rawText.trim() && !hasMedia)
+            throw ClientError_1.ClientError.invalidError();
+        if (rawText.length > htmlSanitizer_1.MAX_MESSAGE_CHARS)
+            throw ClientError_1.ClientError.tooLargeError();
+        const repository = (0, config_1.getMessageRepository)();
+        const message = {
+            text: rawText ? (0, htmlSanitizer_1.sanitizeMessageHtml)(rawText) : "",
+            username: user.username,
+            role: user.isAdmin ? User_1.RoleEnum.ADMIN : User_1.RoleEnum.NON_ADMIN,
+            replyTo: normalized.replyTo || null,
+            media: normalized.media || undefined,
+            time: new Date().toISOString(),
+        };
+        if ((!message.text || !message.text.trim()) && !hasMedia)
+            throw ClientError_1.ClientError.invalidError();
+        const result = await repository.add(message);
+        res.status(200).json(result);
+        const io = (0, socketService_1.getLiveIo)();
+        if (io)
+            io.emit(SocketEvents_1.socketEvents.chatMessage, result);
+    }
+    catch (error) {
+        handleError(error, res);
+    }
+};
+exports.sendMessage = sendMessage;
